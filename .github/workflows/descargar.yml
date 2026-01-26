@@ -32,7 +32,7 @@ jobs:
           echo "data/ limpio:"
           ls -lah data
 
-      # Paso 2: Descargar ZIP (sí, la ruta csv/... devuelve ZIP)
+      # Paso 2: Descargar ZIP SEACE (csv) 1 mes
       - name: Descargar ZIP SEACE (csv)
         shell: bash
         run: |
@@ -46,13 +46,13 @@ jobs:
           curl -L -f -sS "$URL" -o "$ZIP"
           test -s "$ZIP"
 
-          echo "Tipo:"
+          echo "Tipo de archivo:"
           file "$ZIP"
 
-          echo "Contenido ZIP (primeros 50):"
-          unzip -l "$ZIP" | head -n 50
+          echo "Contenido ZIP (primeros 80):"
+          unzip -l "$ZIP" | head -n 80
 
-      # Paso 3: Extraer TODOS los CSV del ZIP a tmp/unzipped
+      # Paso 3: Extraer TODOS los CSV
       - name: Extraer CSVs
         shell: bash
         run: |
@@ -66,7 +66,7 @@ jobs:
           echo "Total CSV: $COUNT"
           test "$COUNT" -gt 0
 
-      # Paso 4: Normalizar headers + cargar cada CSV a BigQuery
+      # Paso 4: Crear dataset (si existe, no falla) + normalizar headers + cargar a BQ
       - name: Normalizar headers y cargar cada CSV a BigQuery
         shell: bash
         run: |
@@ -75,8 +75,8 @@ jobs:
           PROJECT_ID="heroic-ruler-481618-e5"
           DATASET="github_actions"
 
-          # (Opcional) crear dataset si no existe (no falla si ya existe)
-          bq --project_id="$PROJECT_ID" mk --dataset --if_not_exists "$PROJECT_ID:$DATASET"
+          # Crear dataset si no existe (si ya existe, ignora el error)
+          bq --project_id="$PROJECT_ID" mk --dataset "$PROJECT_ID:$DATASET" || true
 
           python - <<'PY'
           import os, re, glob, subprocess, sys
@@ -91,6 +91,7 @@ jobs:
               for c in cols:
                   c = c.strip()
 
+                  # Normalización para BigQuery
                   c = c.replace("/", "_")
                   c = c.replace(" ", "_")
                   c = c.replace("-", "_")
@@ -102,6 +103,7 @@ jobs:
                   if c[0].isdigit():
                       c = "c_" + c
 
+                  # Evitar duplicados
                   base = c
                   k = seen.get(base, 0)
                   if k > 0:
@@ -117,11 +119,13 @@ jobs:
               print("No se encontraron CSVs para procesar.")
               sys.exit(1)
 
+          os.makedirs("data", exist_ok=True)
+
           for src in csv_paths:
               base = os.path.basename(src)
               name_no_ext = os.path.splitext(base)[0]
 
-              # Nombre tabla BigQuery: solo letras/numeros/_ (y no empezar con numero)
+              # Nombre tabla BigQuery: solo letras/numeros/_ y no empezar con número
               table = re.sub(r"[^A-Za-z0-9_]", "_", name_no_ext)
               table = re.sub(r"_+", "_", table).strip("_")
               if not table:
@@ -129,28 +133,26 @@ jobs:
               if table[0].isdigit():
                   table = "t_" + table
 
-              # rutas output
               out_clean = os.path.join("data", f"{table}.csv")
 
-              # 1) leer binario, quitar NULs
+              # 1) Leer binario y quitar NUL (ASCII 0)
               with open(src, "rb") as f:
                   b = f.read().replace(b"\x00", b"")
 
-              # 2) decodificar lo mejor posible (si hay caracteres raros, reemplaza)
+              # 2) Decodificar tolerante
               text = b.decode("utf-8", errors="replace").splitlines(True)
               if not text:
                   print(f"[SKIP] {base}: archivo vacío")
                   continue
 
-              # 3) normalizar header (primera línea)
+              # 3) Normalizar header (primera línea)
               text[0] = normalize_headers_line(text[0])
 
-              # 4) escribir CSV listo para BigQuery
-              os.makedirs("data", exist_ok=True)
+              # 4) Guardar CSV listo
               with open(out_clean, "w", encoding="utf-8", newline="") as g:
                   g.writelines(text)
 
-              # 5) cargar a BigQuery (reemplaza tabla cada vez)
+              # 5) Cargar a BigQuery (reemplaza tabla)
               full_table = f"{DATASET}.{table}"
 
               cmd = [
@@ -167,7 +169,6 @@ jobs:
               ]
 
               print(f"\n=== Cargando {base} -> {full_table} ===")
-              print("CMD:", " ".join(cmd))
               r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
               print(r.stdout)
 
@@ -178,7 +179,7 @@ jobs:
           print("\nOK: Todas las tablas cargadas.")
           PY
 
-      # Paso 5: Mostrar qué quedó en data/ (solo para que veas)
+      # Paso 5: Ver qué quedó (solo para depurar)
       - name: Ver data/
         shell: bash
         run: |
