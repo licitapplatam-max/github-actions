@@ -13,30 +13,47 @@ jobs:
       - name: Checkout (chék-aut)
         uses: actions/checkout@v4
 
-      - name: Descargar JSON de los últimos 3 meses
+      - name: Limpiar JSON antiguos
+        run: |
+          rm -f data/*.json || true
+          rm -f data/*.zip || true
+
+      - name: Descargar y extraer últimos 3 meses
         run: |
           set -e
-          mkdir -p data
+          mkdir -p data/tmp
 
           for i in 0 1 2; do
             YEAR=$(date -u -d "-$i month" +%Y)
             MONTH=$(date -u -d "-$i month" +%m)
 
-            echo "Descargando $YEAR-$MONTH ..."
+            echo "Procesando $YEAR-$MONTH"
 
+            ZIP="data/seace_v3_${YEAR}_${MONTH}.zip"
             URL="https://contratacionesabiertas.oece.gob.pe/api/v1/file/seace_v3/json/$YEAR/$MONTH"
-            FILE="data/seace_v3_${YEAR}_${MONTH}.json"
 
             curl -L -sS -X GET \
               "$URL" \
               -H "accept: */*" \
-              -o "$FILE"
+              -o "$ZIP"
 
-            # Validar que el archivo no esté vacío
-            test -s "$FILE"
+            # Validar ZIP
+            test -s "$ZIP"
 
-            echo "OK: $FILE"
+            # Extraer
+            unzip -o "$ZIP" -d data/tmp
+
           done
+
+          # Mover todos los JSON al nivel data/
+          find data/tmp -name "*.json" -exec mv {} data/ \;
+
+          # Limpiar temporales
+          rm -rf data/tmp
+          rm -f data/*.zip
+
+          echo "Archivos finales:"
+          ls -lh data/*.json
 
       - name: Commit de los JSON al repo (kó-mit)
         run: |
@@ -46,3 +63,4 @@ jobs:
           git add data/*.json
           git commit -m "Actualizar JSON SEACE últimos 3 meses" || exit 0
           git push
+
