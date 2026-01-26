@@ -8,35 +8,45 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Autenticación Google (gú-gol)
+      # Paso 1: Autenticación con Google
+      - name: Autenticación Google
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
+      # Paso 2: Setup gcloud (necesario para auth estable)
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
 
+      # Paso 3: Instalar librerías Python para Drive API
       - name: Instalar dependencias
         run: |
-          pip install --quiet google-api-python-client google-auth-httplib2 google-auth-oauthlib
+          python -m pip install --upgrade pip
+          pip install google-api-python-client google-auth google-auth-httplib2
 
+      # Paso 4: Descargar XLSX reales (SEACE)
       - name: Descargar XLSX
         run: |
+          set -e
           mkdir -p data
 
-          # EJEMPLO: cambia la URL real del XLSX
-          curl -L -o data/seace_2026_01.xlsx \
-            "URL_REAL_DEL_XLSX_AQUI"
+          # EJEMPLO REAL: ajusta año/mes si quieres
+          curl -L -f \
+            "https://contratacionesabiertas.oece.gob.pe/api/v1/file/seace_v3/xlsx/2026/01" \
+            -o data/seace_2026_01.xlsx
 
+          echo "Archivos descargados:"
           ls -lh data/
 
+      # Paso 5: Subir XLSX a Google Drive
       - name: Subir XLSX a Google Drive
         run: |
+          set -e
           python - <<'PY'
+          import os
           from google.oauth2 import service_account
           from googleapiclient.discovery import build
           from googleapiclient.http import MediaFileUpload
-          import os
 
           FOLDER_ID = "1wuqTZSGIS-qBVy3nSYucgxJxHi9TPTEt"
 
@@ -47,23 +57,28 @@ jobs:
 
           service = build("drive", "v3", credentials=creds)
 
-          for file in os.listdir("data"):
-              if file.endswith(".xlsx"):
-                  media = MediaFileUpload(
-                      f"data/{file}",
-                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                  )
+          files = [f for f in os.listdir("data") if f.endswith(".xlsx")]
+          if not files:
+              raise RuntimeError("No se encontraron archivos XLSX para subir")
 
-                  file_metadata = {
-                      "name": file,
-                      "parents": [FOLDER_ID]
-                  }
+          for file in files:
+              path = os.path.join("data", file)
+              media = MediaFileUpload(
+                  path,
+                  mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                  resumable=True
+              )
 
-                  uploaded = service.files().create(
-                      body=file_metadata,
-                      media_body=media,
-                      fields="id"
-                  ).execute()
+              metadata = {
+                  "name": file,
+                  "parents": [FOLDER_ID]
+              }
 
-                  print(f"Subido: {file} -> ID {uploaded['id']}")
+              uploaded = service.files().create(
+                  body=metadata,
+                  media_body=media,
+                  fields="id"
+              ).execute()
+
+              print(f"Subido correctamente: {file} -> ID {uploaded['id']}")
           PY
