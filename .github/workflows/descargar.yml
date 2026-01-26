@@ -1,0 +1,17 @@
+name: Descargar repo
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+
+      - name: Ver archivos descargados
+        run: ls -la
