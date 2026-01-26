@@ -1,17 +1,40 @@
-name: Descargar repo
+name: Descargar JSON SEACE
 
 on:
+  workflow_dispatch: {}
   push:
-    branches:
-      - main
+    branches: [ "main" ]
 
 jobs:
-  download:
+  fetch_json:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Descargar el repositorio
+      - name: Checkout (chék-aut)
         uses: actions/checkout@v4
 
-      - name: Ver archivos descargados
-        run: ls -la
+      - name: Descargar JSON con curl (kérl)
+        run: |
+          set -e
+          mkdir -p data
+
+          curl -L -sS -X GET \
+            "https://contratacionesabiertas.oece.gob.pe/api/v1/file/seace_v3/json/2026/01" \
+            -H "accept: */*" \
+            -o "data/seace_v3_2026_01.json"
+
+          # Validación básica: archivo no vacío
+          test -s "data/seace_v3_2026_01.json"
+
+          echo "Primeras 20 líneas:"
+          head -n 20 "data/seace_v3_2026_01.json"
+
+      - name: Commit del archivo al repo (kó-mit)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add data/seace_v3_2026_01.json
+          git commit -m "Descargar JSON SEACE 2026-01" || exit 0
+          git push
+
