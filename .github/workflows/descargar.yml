@@ -4,36 +4,52 @@ on:
   workflow_dispatch: {}
 
 jobs:
-  load_csv_bq:
+  fetch_csv_bq:
     runs-on: ubuntu-latest
 
     steps:
-      # 1) Autenticación Google
+      # Paso 1: Checkout
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Paso 2: Autenticación Google
       - name: Auth Google
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      # 2) Setup gcloud + bq
+      # Paso 3: Setup gcloud + bq
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: heroic-ruler-481618-e5
 
-      # 3) Descargar CSV (1 mes)
-      - name: Descargar CSV SEACE
+      # Paso 4: Limpiar carpeta data (IGUAL que con JSON)
+      - name: Limpiar carpeta data
         run: |
           set -e
           mkdir -p data
+          rm -f data/*.json data/*.csv data/*.zip || true
+          echo "Contenido de data después de limpiar:"
+          ls -lh data
+
+      # Paso 5: Descargar CSV (MISMA carpeta data)
+      - name: Descargar CSV SEACE
+        run: |
+          set -e
 
           curl -L -f \
             "https://contratacionesabiertas.oece.gob.pe/api/v1/file/seace_v3/csv/2026/01" \
             -o data/seace_v3_2026_01.csv
 
-          ls -lh data/
+          # Validación básica
           test -s data/seace_v3_2026_01.csv
 
-      # 4) Subir a BigQuery
+          echo "CSV descargado:"
+          ls -lh data/seace_v3_2026_01.csv
+          head -n 5 data/seace_v3_2026_01.csv
+
+      # Paso 6: Cargar CSV a BigQuery (como el JSON)
       - name: Cargar CSV a BigQuery
         run: |
           set -e
