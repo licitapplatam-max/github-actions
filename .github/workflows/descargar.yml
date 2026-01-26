@@ -1,129 +1,69 @@
-name: Descargar JSON SEACE (últimos 3 meses) y subir a BigQuery
+name: Descargar XLSX y subir a Google Drive
 
 on:
   workflow_dispatch: {}
-  push:
-    branches: [ "main" ]
 
 jobs:
-  fetch_json:
+  fetch_xlsx:
     runs-on: ubuntu-latest
 
     steps:
-      # Paso 1: Descargar el repo al runner (GitHub Actions necesita esto para trabajar)
-      - name: Checkout (chék-aut)
-        uses: actions/checkout@v4
-
-      # Paso 2: Limpiar la carpeta data localmente (en el runner)
-      # Nota: la eliminación real en el repo se "registra" cuando hacemos git add -A data y commit.
-      - name: Limpiar carpeta data (y marcar borrado en Git)
-        run: |
-          set -e
-          mkdir -p data
-          # Borra todo lo anterior (solo dentro de data)
-          rm -f data/*.json data/*.zip || true
-          rm -rf data/tmp || true
-
-      # Paso 3: Calcular los últimos 3 meses y descargar el ZIP de cada mes
-      # Luego extraer el contenido y mover todos los .json a /data
-      - name: Descargar ZIP, verificar, extraer JSON (últimos 3 meses)
-        run: |
-          set -e
-          mkdir -p data/tmp
-
-          for i in 0 1 2; do
-            YEAR=$(date -u -d "-$i month" +%Y)
-            MONTH=$(date -u -d "-$i month" +%m)
-
-            echo "=== Mes: $YEAR-$MONTH ==="
-
-            URL="https://contratacionesabiertas.oece.gob.pe/api/v1/file/seace_v3/json/$YEAR/$MONTH"
-            ZIP="data/seace_v3_${YEAR}_${MONTH}.zip"
-
-            # 1) Descargar ZIP
-            curl -L -sS -X GET "$URL" -H "accept: */*" -o "$ZIP"
-            test -s "$ZIP"
-
-            # 2) Verificar que sea ZIP (no HTML, no error)
-            echo "Tipo de archivo:"
-            file "$ZIP"
-
-            # 3) Ver contenido del ZIP (para confirmar que hay JSON)
-            echo "Contenido del ZIP:"
-            unzip -l "$ZIP" | head -n 50
-
-            # 4) Extraer
-            unzip -o "$ZIP" -d "data/tmp/$YEAR-$MONTH"
-          done
-
-          # 5) Mover TODOS los JSON extraídos a data/
-          find data/tmp -type f -name "*.json" -print -exec mv -f {} data/ \;
-
-          # 6) Limpiar temporales y zips (si no quieres guardarlos)
-          rm -rf data/tmp
-          rm -f data/*.zip
-
-          echo "=== Archivos finales en data/ ==="
-          ls -lh data/
-
-      # Paso 4: Autenticación con Google Cloud usando un Secret del repo
-      # Requisito: Debes tener creado el secret GCP_SA_KEY con el JSON del Service Account.
-      - name: Autenticación Google Cloud (gú-gol klaud)
+      - name: Autenticación Google (gú-gol)
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      # Paso 5: Instalar gcloud para poder usar bq (bi-kiú)
-      - name: Setup gcloud (sét-ap jí-klaud)
+      - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
-        with:
-          project_id: heroic-ruler-481618-e5
 
-      # Paso 6: Subir cada archivo JSON a BigQuery como una tabla con su nombre
-      # Tabla = nombre del archivo sin .json. Ej: seace_v3_2026_01.json -> tabla seace_v3_2026_01
-      # Nota: esto asume NEWLINE_DELIMITED_JSON (NDJSON). Si tus JSON no son NDJSON, fallará.
-      - name: Subir JSON a BigQuery (bi-kiú) tabla por archivo
+      - name: Instalar dependencias
         run: |
-          set -e
+          pip install --quiet google-api-python-client google-auth-httplib2 google-auth-oauthlib
 
-          PROJECT_ID="heroic-ruler-481618-e5"
-          DATASET_ID="github_actions"
-
-          echo "=== Archivos a cargar a BigQuery ==="
-          ls -lh data/*.json
-
-          for f in data/*.json; do
-            base=$(basename "$f" .json)
-            table="$base"
-
-            echo "===================================="
-            echo "Cargando archivo: $f"
-            echo "Tabla destino: ${PROJECT_ID}:${DATASET_ID}.${table}"
-
-            bq load \
-              --project_id="$PROJECT_ID" \
-              --source_format=NEWLINE_DELIMITED_JSON \
-              --autodetect \
-              --replace \
-              "${DATASET_ID}.${table}" \
-              "$f"
-
-            echo "OK: ${DATASET_ID}.${table}"
-          done
-
-      # Paso 7: Commit al repo incluyendo borrados (esto elimina del repo los archivos viejos)
-      # Importante: git add -A data incluye nuevos, modificados y eliminados dentro de /data
-      - name: Commit al repo (kó-mit) incluyendo borrados
+      - name: Descargar XLSX
         run: |
-          set -e
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p data
 
-          # Esto incluye nuevos, modificados y borrados
-          git add -A data
+          # EJEMPLO: cambia la URL real del XLSX
+          curl -L -o data/seace_2026_01.xlsx \
+            "URL_REAL_DEL_XLSX_AQUI"
 
-          echo "=== Git status (para ver qué va al commit) ==="
-          git status --porcelain
+          ls -lh data/
 
-          git commit -m "Actualizar JSON SEACE últimos 3 meses" || exit 0
-          git push
+      - name: Subir XLSX a Google Drive
+        run: |
+          python - <<'PY'
+          from google.oauth2 import service_account
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+          import os
+
+          FOLDER_ID = "1wuqTZSGIS-qBVy3nSYucgxJxHi9TPTEt"
+
+          creds = service_account.Credentials.from_service_account_file(
+              os.environ["GOOGLE_APPLICATION_CREDENTIALS"],
+              scopes=["https://www.googleapis.com/auth/drive"]
+          )
+
+          service = build("drive", "v3", credentials=creds)
+
+          for file in os.listdir("data"):
+              if file.endswith(".xlsx"):
+                  media = MediaFileUpload(
+                      f"data/{file}",
+                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                  )
+
+                  file_metadata = {
+                      "name": file,
+                      "parents": [FOLDER_ID]
+                  }
+
+                  uploaded = service.files().create(
+                      body=file_metadata,
+                      media_body=media,
+                      fields="id"
+                  ).execute()
+
+                  print(f"Subido: {file} -> ID {uploaded['id']}")
+          PY
