@@ -21,27 +21,19 @@ jobs:
         with:
           project_id: heroic-ruler-481618-e5
 
-      # 1) LIMPIEZA REAL: borra TODO dentro de data/ (incluye subcarpetas)
+      # Paso 1: Limpieza REAL de data/
       - name: Limpiar carpeta data (real)
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p data tmp
-          echo "ANTES (data/):"
-          ls -lah data || true
-
-          # borra todo lo que haya dentro (archivos y carpetas)
           rm -rf data/*
-
-          echo "DESPUÉS (data/):"
+          rm -rf tmp/*
+          echo "data/ limpio:"
           ls -lah data
 
-          # limpia temporales también
-          rm -rf tmp/*
-          ls -lah tmp
-
-      # 2) DESCARGA: puede venir como ZIP o como CSV
-      - name: Descargar archivo (puede ser ZIP o CSV)
+      # Paso 2: Descargar (puede venir ZIP o CSV) y dejar CSV en data/
+      - name: Descargar y obtener CSV final
         shell: bash
         run: |
           set -euxo pipefail
@@ -51,78 +43,117 @@ jobs:
 
           URL="https://contratacionesabiertas.oece.gob.pe/api/v1/file/seace_v3/csv/${YEAR}/${MONTH}"
           RAW="tmp/seace_${YEAR}_${MONTH}.bin"
+          OUT="data/seace_v3_${YEAR}_${MONTH}.csv"
 
-          echo "Descargando desde: $URL"
           curl -L -f -sS "$URL" -o "$RAW"
           test -s "$RAW"
 
-          echo "Tipo detectado (file):"
+          echo "Tipo descargado:"
           file "$RAW"
 
-          # Si viene comprimido, extraemos CSV(s)
           if file "$RAW" | grep -qi "zip"; then
-            echo "Vino como ZIP. Extrayendo..."
+            echo "Vino como ZIP, extrayendo..."
             unzip -o "$RAW" -d tmp/unzipped
-
-            echo "Archivos dentro del ZIP:"
-            find tmp/unzipped -type f -maxdepth 4 -print
-
-            # agarramos el primer .csv que encontremos
             CSV_IN="$(find tmp/unzipped -type f -iname '*.csv' | head -n 1)"
             if [ -z "$CSV_IN" ]; then
-              echo "ERROR: No se encontró ningun .csv dentro del ZIP"
+              echo "ERROR: no hay .csv dentro del ZIP"
               exit 1
             fi
-
-            cp "$CSV_IN" "data/seace_v3_${YEAR}_${MONTH}.csv"
+            cp "$CSV_IN" "$OUT"
           else
-            echo "Vino como texto. Guardando como CSV directo."
-            cp "$RAW" "data/seace_v3_${YEAR}_${MONTH}.csv"
+            cp "$RAW" "$OUT"
           fi
 
-          echo "Archivo final en data/:"
-          ls -lh data/
+          echo "CSV final:"
+          ls -lh "$OUT"
+          echo "Primeras 3 líneas:"
+          head -n 3 "$OUT"
 
-          echo "Primeras 5 líneas:"
-          head -n 5 "data/seace_v3_${YEAR}_${MONTH}.csv"
-
-      # 3) LIMPIEZA ASCII 0 (si aparece)
+      # Paso 3: Quitar ASCII 0 (NUL) si existe
       - name: Quitar ASCII 0 (NUL) si existe
         shell: bash
         run: |
           set -euxo pipefail
+          IN="data/seace_v3_2026_01.csv"
+          OUT="tmp/no_nul.csv"
 
-          YEAR="2026"
-          MONTH="01"
-          IN="data/seace_v3_${YEAR}_${MONTH}.csv"
-          OUT="data/seace_v3_${YEAR}_${MONTH}_clean.csv"
+          # quitar NUL siempre (si no hay, no pasa nada)
+          tr -d '\000' < "$IN" > "$OUT"
+          test -s "$OUT"
+
+          echo "Preview sin NUL:"
+          head -n 2 "$OUT"
+
+      # Paso 4: Normalizar HEADERS (aquí arreglamos el / que rompe BigQuery)
+      - name: Normalizar headers para BigQuery
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          IN="tmp/no_nul.csv"
+          OUT="data/seace_v3_2026_01_clean.csv"
 
           python - <<'PY'
-          p="data/seace_v3_2026_01.csv"
-          b=open(p,"rb").read()
-          print("Bytes:", len(b))
-          print("NULs:", b.count(b"\x00"))
+          import re
+
+          inp = "tmp/no_nul.csv"
+          out = "data/seace_v3_2026_01_clean.csv"
+
+          with open(inp, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+
+          if not lines:
+            raise SystemExit("CSV vacío")
+
+          header = lines[0].rstrip("\n\r")
+
+          # Split simple por coma: en estos CSV los headers NO deberían traer comas dentro de comillas
+          cols = header.split(",")
+
+          fixed = []
+          seen = {}
+          for c in cols:
+            c = c.strip()
+
+            # Reglas de normalización
+            c = c.replace("/", "_")
+            c = c.replace(" ", "_")
+            c = c.replace("-", "_")
+            c = re.sub(r"[^A-Za-z0-9_]", "_", c)
+            c = re.sub(r"_+", "_", c).strip("_")
+
+            if not c:
+              c = "col"
+
+            if c[0].isdigit():
+              c = "c_" + c
+
+            # Evitar duplicados (muy importante)
+            base = c
+            k = seen.get(base, 0)
+            if k > 0:
+              c = f"{base}_{k}"
+            seen[base] = k + 1
+
+            fixed.append(c)
+
+          lines[0] = ",".join(fixed) + "\n"
+
+          with open(out, "w", encoding="utf-8", newline="") as g:
+            g.writelines(lines)
+
+          print("Header original (primeros 200 chars):")
+          print(header[:200])
+          print("Header normalizado (primeros 200 chars):")
+          print(lines[0][:200])
+          print("Columnas:", len(fixed))
           PY
 
-          NULS=$(python - <<'PY'
-          b=open("data/seace_v3_2026_01.csv","rb").read()
-          print(b.count(b"\x00"))
-          PY
-          )
+          echo "Preview final:"
+          head -n 2 "$OUT"
+          ls -lh "$OUT"
 
-          if [ "$NULS" != "0" ]; then
-            echo "Se detectaron NULs ($NULS). Limpiando..."
-            tr -d '\000' < "$IN" > "$OUT"
-          else
-            echo "No hay NULs. Copiando sin cambios..."
-            cp "$IN" "$OUT"
-          fi
-
-          test -s "$OUT"
-          echo "Preview clean:"
-          head -n 3 "$OUT"
-
-      # 4) CARGA A BIGQUERY (big-kuéri)
+      # Paso 5: Cargar a BigQuery
       - name: Cargar a BigQuery (big-kuéri)
         shell: bash
         run: |
@@ -132,9 +163,6 @@ jobs:
           DATASET="github_actions"
           TABLE="seace_v3_2026_01"
           FILE="data/seace_v3_2026_01_clean.csv"
-
-          echo "Cargando a ${PROJECT_ID}:${DATASET}.${TABLE}"
-          ls -lh "$FILE"
 
           bq --project_id="$PROJECT_ID" load \
             --source_format=CSV \
@@ -147,4 +175,4 @@ jobs:
             "${DATASET}.${TABLE}" \
             "$FILE"
 
-          echo "OK. Tabla lista."
+          echo "OK. Tabla lista: ${DATASET}.${TABLE}"
