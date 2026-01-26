@@ -1,4 +1,4 @@
-name: Descargar JSON SEACE (últimos 3 meses)
+name: Descargar JSON SEACE (últimos 3 meses) y subir a BigQuery
 
 on:
   workflow_dispatch: {}
@@ -10,9 +10,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Paso 1: Descargar el repo al runner (GitHub Actions necesita esto para trabajar)
       - name: Checkout (chék-aut)
         uses: actions/checkout@v4
 
+      # Paso 2: Limpiar la carpeta data localmente (en el runner)
+      # Nota: la eliminación real en el repo se "registra" cuando hacemos git add -A data y commit.
       - name: Limpiar carpeta data (y marcar borrado en Git)
         run: |
           set -e
@@ -21,6 +24,8 @@ jobs:
           rm -f data/*.json data/*.zip || true
           rm -rf data/tmp || true
 
+      # Paso 3: Calcular los últimos 3 meses y descargar el ZIP de cada mes
+      # Luego extraer el contenido y mover todos los .json a /data
       - name: Descargar ZIP, verificar, extraer JSON (últimos 3 meses)
         run: |
           set -e
@@ -61,13 +66,60 @@ jobs:
           echo "=== Archivos finales en data/ ==="
           ls -lh data/
 
+      # Paso 4: Autenticación con Google Cloud usando un Secret del repo
+      # Requisito: Debes tener creado el secret GCP_SA_KEY con el JSON del Service Account.
+      - name: Autenticación Google Cloud (gú-gol klaud)
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      # Paso 5: Instalar gcloud para poder usar bq (bi-kiú)
+      - name: Setup gcloud (sét-ap jí-klaud)
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: heroic-ruler-481618-e5
+
+      # Paso 6: Subir cada archivo JSON a BigQuery como una tabla con su nombre
+      # Tabla = nombre del archivo sin .json. Ej: seace_v3_2026_01.json -> tabla seace_v3_2026_01
+      # Nota: esto asume NEWLINE_DELIMITED_JSON (NDJSON). Si tus JSON no son NDJSON, fallará.
+      - name: Subir JSON a BigQuery (bi-kiú) tabla por archivo
+        run: |
+          set -e
+
+          PROJECT_ID="heroic-ruler-481618-e5"
+          DATASET_ID="github_actions"
+
+          echo "=== Archivos a cargar a BigQuery ==="
+          ls -lh data/*.json
+
+          for f in data/*.json; do
+            base=$(basename "$f" .json)
+            table="$base"
+
+            echo "===================================="
+            echo "Cargando archivo: $f"
+            echo "Tabla destino: ${PROJECT_ID}:${DATASET_ID}.${table}"
+
+            bq load \
+              --project_id="$PROJECT_ID" \
+              --source_format=NEWLINE_DELIMITED_JSON \
+              --autodetect \
+              --replace \
+              "${DATASET_ID}.${table}" \
+              "$f"
+
+            echo "OK: ${DATASET_ID}.${table}"
+          done
+
+      # Paso 7: Commit al repo incluyendo borrados (esto elimina del repo los archivos viejos)
+      # Importante: git add -A data incluye nuevos, modificados y eliminados dentro de /data
       - name: Commit al repo (kó-mit) incluyendo borrados
         run: |
           set -e
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Esto es LA CLAVE: incluye nuevos, modificados y borrados
+          # Esto incluye nuevos, modificados y borrados
           git add -A data
 
           echo "=== Git status (para ver qué va al commit) ==="
