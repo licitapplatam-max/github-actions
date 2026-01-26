@@ -1,10 +1,10 @@
-name: Descargar CSV/ZIP SEACE y cargar a BigQuery (1 mes)
+name: SEACE CSV ZIP -> BigQuery (todas las tablas, 1 mes)
 
 on:
   workflow_dispatch: {}
 
 jobs:
-  fetch_csv_bq:
+  seace_zip_to_bq:
     runs-on: ubuntu-latest
 
     steps:
@@ -21,8 +21,8 @@ jobs:
         with:
           project_id: heroic-ruler-481618-e5
 
-      # Paso 1: Limpieza REAL de data/
-      - name: Limpiar carpeta data (real)
+      # Paso 1: Limpieza REAL
+      - name: Limpiar data/ y tmp/
         shell: bash
         run: |
           set -euxo pipefail
@@ -32,147 +32,155 @@ jobs:
           echo "data/ limpio:"
           ls -lah data
 
-      # Paso 2: Descargar (puede venir ZIP o CSV) y dejar CSV en data/
-      - name: Descargar y obtener CSV final
+      # Paso 2: Descargar ZIP (sí, la ruta csv/... devuelve ZIP)
+      - name: Descargar ZIP SEACE (csv)
         shell: bash
         run: |
           set -euxo pipefail
-
           YEAR="2026"
           MONTH="01"
 
           URL="https://contratacionesabiertas.oece.gob.pe/api/v1/file/seace_v3/csv/${YEAR}/${MONTH}"
-          RAW="tmp/seace_${YEAR}_${MONTH}.bin"
-          OUT="data/seace_v3_${YEAR}_${MONTH}.csv"
+          ZIP="tmp/seace_${YEAR}_${MONTH}.zip"
 
-          curl -L -f -sS "$URL" -o "$RAW"
-          test -s "$RAW"
+          curl -L -f -sS "$URL" -o "$ZIP"
+          test -s "$ZIP"
 
-          echo "Tipo descargado:"
-          file "$RAW"
+          echo "Tipo:"
+          file "$ZIP"
 
-          if file "$RAW" | grep -qi "zip"; then
-            echo "Vino como ZIP, extrayendo..."
-            unzip -o "$RAW" -d tmp/unzipped
-            CSV_IN="$(find tmp/unzipped -type f -iname '*.csv' | head -n 1)"
-            if [ -z "$CSV_IN" ]; then
-              echo "ERROR: no hay .csv dentro del ZIP"
-              exit 1
-            fi
-            cp "$CSV_IN" "$OUT"
-          else
-            cp "$RAW" "$OUT"
-          fi
+          echo "Contenido ZIP (primeros 50):"
+          unzip -l "$ZIP" | head -n 50
 
-          echo "CSV final:"
-          ls -lh "$OUT"
-          echo "Primeras 3 líneas:"
-          head -n 3 "$OUT"
-
-      # Paso 3: Quitar ASCII 0 (NUL) si existe
-      - name: Quitar ASCII 0 (NUL) si existe
+      # Paso 3: Extraer TODOS los CSV del ZIP a tmp/unzipped
+      - name: Extraer CSVs
         shell: bash
         run: |
           set -euxo pipefail
-          IN="data/seace_v3_2026_01.csv"
-          OUT="tmp/no_nul.csv"
+          unzip -o "tmp/seace_2026_01.zip" -d "tmp/unzipped"
 
-          # quitar NUL siempre (si no hay, no pasa nada)
-          tr -d '\000' < "$IN" > "$OUT"
-          test -s "$OUT"
+          echo "CSVs encontrados:"
+          find tmp/unzipped -type f -iname "*.csv" -print
 
-          echo "Preview sin NUL:"
-          head -n 2 "$OUT"
+          COUNT=$(find tmp/unzipped -type f -iname "*.csv" | wc -l)
+          echo "Total CSV: $COUNT"
+          test "$COUNT" -gt 0
 
-      # Paso 4: Normalizar HEADERS (aquí arreglamos el / que rompe BigQuery)
-      - name: Normalizar headers para BigQuery
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          IN="tmp/no_nul.csv"
-          OUT="data/seace_v3_2026_01_clean.csv"
-
-          python - <<'PY'
-          import re
-
-          inp = "tmp/no_nul.csv"
-          out = "data/seace_v3_2026_01_clean.csv"
-
-          with open(inp, "r", encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-
-          if not lines:
-            raise SystemExit("CSV vacío")
-
-          header = lines[0].rstrip("\n\r")
-
-          # Split simple por coma: en estos CSV los headers NO deberían traer comas dentro de comillas
-          cols = header.split(",")
-
-          fixed = []
-          seen = {}
-          for c in cols:
-            c = c.strip()
-
-            # Reglas de normalización
-            c = c.replace("/", "_")
-            c = c.replace(" ", "_")
-            c = c.replace("-", "_")
-            c = re.sub(r"[^A-Za-z0-9_]", "_", c)
-            c = re.sub(r"_+", "_", c).strip("_")
-
-            if not c:
-              c = "col"
-
-            if c[0].isdigit():
-              c = "c_" + c
-
-            # Evitar duplicados (muy importante)
-            base = c
-            k = seen.get(base, 0)
-            if k > 0:
-              c = f"{base}_{k}"
-            seen[base] = k + 1
-
-            fixed.append(c)
-
-          lines[0] = ",".join(fixed) + "\n"
-
-          with open(out, "w", encoding="utf-8", newline="") as g:
-            g.writelines(lines)
-
-          print("Header original (primeros 200 chars):")
-          print(header[:200])
-          print("Header normalizado (primeros 200 chars):")
-          print(lines[0][:200])
-          print("Columnas:", len(fixed))
-          PY
-
-          echo "Preview final:"
-          head -n 2 "$OUT"
-          ls -lh "$OUT"
-
-      # Paso 5: Cargar a BigQuery
-      - name: Cargar a BigQuery (big-kuéri)
+      # Paso 4: Normalizar headers + cargar cada CSV a BigQuery
+      - name: Normalizar headers y cargar cada CSV a BigQuery
         shell: bash
         run: |
           set -euxo pipefail
 
           PROJECT_ID="heroic-ruler-481618-e5"
           DATASET="github_actions"
-          TABLE="seace_v3_2026_01"
-          FILE="data/seace_v3_2026_01_clean.csv"
 
-          bq --project_id="$PROJECT_ID" load \
-            --source_format=CSV \
-            --autodetect \
-            --skip_leading_rows=1 \
-            --allow_quoted_newlines \
-            --allow_jagged_rows \
-            --max_bad_records=5000 \
-            --replace \
-            "${DATASET}.${TABLE}" \
-            "$FILE"
+          # (Opcional) crear dataset si no existe (no falla si ya existe)
+          bq --project_id="$PROJECT_ID" mk --dataset --if_not_exists "$PROJECT_ID:$DATASET"
 
-          echo "OK. Tabla lista: ${DATASET}.${TABLE}"
+          python - <<'PY'
+          import os, re, glob, subprocess, sys
+
+          PROJECT_ID = "heroic-ruler-481618-e5"
+          DATASET     = "github_actions"
+
+          def normalize_headers_line(header: str):
+              cols = header.rstrip("\n\r").split(",")
+              fixed = []
+              seen = {}
+              for c in cols:
+                  c = c.strip()
+
+                  c = c.replace("/", "_")
+                  c = c.replace(" ", "_")
+                  c = c.replace("-", "_")
+                  c = re.sub(r"[^A-Za-z0-9_]", "_", c)
+                  c = re.sub(r"_+", "_", c).strip("_")
+
+                  if not c:
+                      c = "col"
+                  if c[0].isdigit():
+                      c = "c_" + c
+
+                  base = c
+                  k = seen.get(base, 0)
+                  if k > 0:
+                      c = f"{base}_{k}"
+                  seen[base] = k + 1
+
+                  fixed.append(c)
+
+              return ",".join(fixed) + "\n"
+
+          csv_paths = sorted(glob.glob("tmp/unzipped/**/*.csv", recursive=True))
+          if not csv_paths:
+              print("No se encontraron CSVs para procesar.")
+              sys.exit(1)
+
+          for src in csv_paths:
+              base = os.path.basename(src)
+              name_no_ext = os.path.splitext(base)[0]
+
+              # Nombre tabla BigQuery: solo letras/numeros/_ (y no empezar con numero)
+              table = re.sub(r"[^A-Za-z0-9_]", "_", name_no_ext)
+              table = re.sub(r"_+", "_", table).strip("_")
+              if not table:
+                  table = "tabla"
+              if table[0].isdigit():
+                  table = "t_" + table
+
+              # rutas output
+              out_clean = os.path.join("data", f"{table}.csv")
+
+              # 1) leer binario, quitar NULs
+              with open(src, "rb") as f:
+                  b = f.read().replace(b"\x00", b"")
+
+              # 2) decodificar lo mejor posible (si hay caracteres raros, reemplaza)
+              text = b.decode("utf-8", errors="replace").splitlines(True)
+              if not text:
+                  print(f"[SKIP] {base}: archivo vacío")
+                  continue
+
+              # 3) normalizar header (primera línea)
+              text[0] = normalize_headers_line(text[0])
+
+              # 4) escribir CSV listo para BigQuery
+              os.makedirs("data", exist_ok=True)
+              with open(out_clean, "w", encoding="utf-8", newline="") as g:
+                  g.writelines(text)
+
+              # 5) cargar a BigQuery (reemplaza tabla cada vez)
+              full_table = f"{DATASET}.{table}"
+
+              cmd = [
+                  "bq", f"--project_id={PROJECT_ID}", "load",
+                  "--source_format=CSV",
+                  "--autodetect",
+                  "--skip_leading_rows=1",
+                  "--allow_quoted_newlines",
+                  "--allow_jagged_rows",
+                  "--max_bad_records=5000",
+                  "--replace",
+                  full_table,
+                  out_clean
+              ]
+
+              print(f"\n=== Cargando {base} -> {full_table} ===")
+              print("CMD:", " ".join(cmd))
+              r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              print(r.stdout)
+
+              if r.returncode != 0:
+                  print(f"[ERROR] Falló carga de {base} -> {full_table}")
+                  sys.exit(r.returncode)
+
+          print("\nOK: Todas las tablas cargadas.")
+          PY
+
+      # Paso 5: Mostrar qué quedó en data/ (solo para que veas)
+      - name: Ver data/
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ls -lah data
