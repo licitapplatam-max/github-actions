@@ -13,12 +13,15 @@ jobs:
       - name: Checkout (chék-aut)
         uses: actions/checkout@v4
 
-      - name: Limpiar JSON antiguos
+      - name: Limpiar carpeta data (y marcar borrado en Git)
         run: |
-          rm -f data/*.json || true
-          rm -f data/*.zip || true
+          set -e
+          mkdir -p data
+          # Borra todo lo anterior (solo dentro de data)
+          rm -f data/*.json data/*.zip || true
+          rm -rf data/tmp || true
 
-      - name: Descargar y extraer últimos 3 meses
+      - name: Descargar ZIP, verificar, extraer JSON (últimos 3 meses)
         run: |
           set -e
           mkdir -p data/tmp
@@ -27,40 +30,48 @@ jobs:
             YEAR=$(date -u -d "-$i month" +%Y)
             MONTH=$(date -u -d "-$i month" +%m)
 
-            echo "Procesando $YEAR-$MONTH"
+            echo "=== Mes: $YEAR-$MONTH ==="
 
-            ZIP="data/seace_v3_${YEAR}_${MONTH}.zip"
             URL="https://contratacionesabiertas.oece.gob.pe/api/v1/file/seace_v3/json/$YEAR/$MONTH"
+            ZIP="data/seace_v3_${YEAR}_${MONTH}.zip"
 
-            curl -L -sS -X GET \
-              "$URL" \
-              -H "accept: */*" \
-              -o "$ZIP"
-
-            # Validar ZIP
+            # 1) Descargar ZIP
+            curl -L -sS -X GET "$URL" -H "accept: */*" -o "$ZIP"
             test -s "$ZIP"
 
-            # Extraer
-            unzip -o "$ZIP" -d data/tmp
+            # 2) Verificar que sea ZIP (no HTML, no error)
+            echo "Tipo de archivo:"
+            file "$ZIP"
 
+            # 3) Ver contenido del ZIP (para confirmar que hay JSON)
+            echo "Contenido del ZIP:"
+            unzip -l "$ZIP" | head -n 50
+
+            # 4) Extraer
+            unzip -o "$ZIP" -d "data/tmp/$YEAR-$MONTH"
           done
 
-          # Mover todos los JSON al nivel data/
-          find data/tmp -name "*.json" -exec mv {} data/ \;
+          # 5) Mover TODOS los JSON extraídos a data/
+          find data/tmp -type f -name "*.json" -print -exec mv -f {} data/ \;
 
-          # Limpiar temporales
+          # 6) Limpiar temporales y zips (si no quieres guardarlos)
           rm -rf data/tmp
           rm -f data/*.zip
 
-          echo "Archivos finales:"
-          ls -lh data/*.json
+          echo "=== Archivos finales en data/ ==="
+          ls -lh data/
 
-      - name: Commit de los JSON al repo (kó-mit)
+      - name: Commit al repo (kó-mit) incluyendo borrados
         run: |
+          set -e
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add data/*.json
+          # Esto es LA CLAVE: incluye nuevos, modificados y borrados
+          git add -A data
+
+          echo "=== Git status (para ver qué va al commit) ==="
+          git status --porcelain
+
           git commit -m "Actualizar JSON SEACE últimos 3 meses" || exit 0
           git push
-
