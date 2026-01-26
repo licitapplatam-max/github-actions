@@ -1,4 +1,4 @@
-name: Descargar CSV SEACE y cargar a BigQuery (1 mes)
+name: Descargar CSV/ZIP SEACE y cargar a BigQuery (1 mes)
 
 on:
   workflow_dispatch: {}
@@ -8,35 +8,40 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Paso 1: Checkout (para que exista la carpeta del repo)
-      - name: Checkout
+      - name: Checkout (chék-aut)
         uses: actions/checkout@v4
 
-      # Paso 2: Auth Google con tu Service Account (key en secrets)
-      - name: Auth Google
+      - name: Auth Google (gúgol)
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      # Paso 3: Setup gcloud (incluye bq)
-      - name: Setup gcloud
+      - name: Setup gcloud (yi-kláud)
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: heroic-ruler-481618-e5
 
-      # Paso 4: Limpiar carpeta data
-      - name: Limpiar carpeta data
+      # 1) LIMPIEZA REAL: borra TODO dentro de data/ (incluye subcarpetas)
+      - name: Limpiar carpeta data (real)
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p data
-          rm -f data/*.csv data/*.json data/*.zip || true
-          rm -f data/* || true
-          echo "data/ después de limpiar:"
+          mkdir -p data tmp
+          echo "ANTES (data/):"
+          ls -lah data || true
+
+          # borra todo lo que haya dentro (archivos y carpetas)
+          rm -rf data/*
+
+          echo "DESPUÉS (data/):"
           ls -lah data
 
-      # Paso 5: Descargar CSV (1 mes) en data/
-      - name: Descargar CSV SEACE
+          # limpia temporales también
+          rm -rf tmp/*
+          ls -lah tmp
+
+      # 2) DESCARGA: puede venir como ZIP o como CSV
+      - name: Descargar archivo (puede ser ZIP o CSV)
         shell: bash
         run: |
           set -euxo pipefail
@@ -45,28 +50,52 @@ jobs:
           MONTH="01"
 
           URL="https://contratacionesabiertas.oece.gob.pe/api/v1/file/seace_v3/csv/${YEAR}/${MONTH}"
-          OUT="data/seace_v3_${YEAR}_${MONTH}.csv"
+          RAW="tmp/seace_${YEAR}_${MONTH}.bin"
 
-          echo "Descargando: $URL"
-          curl -L -f -sS "$URL" -o "$OUT"
+          echo "Descargando desde: $URL"
+          curl -L -f -sS "$URL" -o "$RAW"
+          test -s "$RAW"
 
-          echo "Archivo descargado:"
-          ls -lh "$OUT"
+          echo "Tipo detectado (file):"
+          file "$RAW"
 
-          echo "Tipo de archivo (debe decir text/csv o similar):"
-          file "$OUT"
+          # Si viene comprimido, extraemos CSV(s)
+          if file "$RAW" | grep -qi "zip"; then
+            echo "Vino como ZIP. Extrayendo..."
+            unzip -o "$RAW" -d tmp/unzipped
+
+            echo "Archivos dentro del ZIP:"
+            find tmp/unzipped -type f -maxdepth 4 -print
+
+            # agarramos el primer .csv que encontremos
+            CSV_IN="$(find tmp/unzipped -type f -iname '*.csv' | head -n 1)"
+            if [ -z "$CSV_IN" ]; then
+              echo "ERROR: No se encontró ningun .csv dentro del ZIP"
+              exit 1
+            fi
+
+            cp "$CSV_IN" "data/seace_v3_${YEAR}_${MONTH}.csv"
+          else
+            echo "Vino como texto. Guardando como CSV directo."
+            cp "$RAW" "data/seace_v3_${YEAR}_${MONTH}.csv"
+          fi
+
+          echo "Archivo final en data/:"
+          ls -lh data/
 
           echo "Primeras 5 líneas:"
-          head -n 5 "$OUT"
+          head -n 5 "data/seace_v3_${YEAR}_${MONTH}.csv"
 
-      # Paso 6: Diagnóstico: contar NULs (ASCII 0) y limpiar si aparecen
-      - name: Detectar y limpiar ASCII 0 (NUL) si existe
+      # 3) LIMPIEZA ASCII 0 (si aparece)
+      - name: Quitar ASCII 0 (NUL) si existe
         shell: bash
         run: |
           set -euxo pipefail
 
-          IN="data/seace_v3_2026_01.csv"
-          CLEAN="data/seace_v3_2026_01_clean.csv"
+          YEAR="2026"
+          MONTH="01"
+          IN="data/seace_v3_${YEAR}_${MONTH}.csv"
+          OUT="data/seace_v3_${YEAR}_${MONTH}_clean.csv"
 
           python - <<'PY'
           p="data/seace_v3_2026_01.csv"
@@ -75,7 +104,6 @@ jobs:
           print("NULs:", b.count(b"\x00"))
           PY
 
-          # Si hay NULs, los quitamos. Si no hay, usamos el original.
           NULS=$(python - <<'PY'
           b=open("data/seace_v3_2026_01.csv","rb").read()
           print(b.count(b"\x00"))
@@ -83,20 +111,19 @@ jobs:
           )
 
           if [ "$NULS" != "0" ]; then
-            echo "Se detectaron NULs ($NULS). Limpiando con tr..."
-            tr -d '\000' < "$IN" > "$CLEAN"
-            test -s "$CLEAN"
-            echo "Limpio creado: $CLEAN"
+            echo "Se detectaron NULs ($NULS). Limpiando..."
+            tr -d '\000' < "$IN" > "$OUT"
           else
-            echo "No hay NULs. Copiando original como clean para flujo uniforme."
-            cp "$IN" "$CLEAN"
+            echo "No hay NULs. Copiando sin cambios..."
+            cp "$IN" "$OUT"
           fi
 
-          echo "Preview (primeras 3 líneas del clean):"
-          head -n 3 "$CLEAN"
+          test -s "$OUT"
+          echo "Preview clean:"
+          head -n 3 "$OUT"
 
-      # Paso 7: Cargar a BigQuery (con flags tolerantes para CSV grande)
-      - name: Cargar CSV a BigQuery
+      # 4) CARGA A BIGQUERY (big-kuéri)
+      - name: Cargar a BigQuery (big-kuéri)
         shell: bash
         run: |
           set -euxo pipefail
@@ -106,8 +133,7 @@ jobs:
           TABLE="seace_v3_2026_01"
           FILE="data/seace_v3_2026_01_clean.csv"
 
-          echo "Cargando a: ${PROJECT_ID}:${DATASET}.${TABLE}"
-          echo "Usando archivo: $FILE"
+          echo "Cargando a ${PROJECT_ID}:${DATASET}.${TABLE}"
           ls -lh "$FILE"
 
           bq --project_id="$PROJECT_ID" load \
@@ -121,4 +147,4 @@ jobs:
             "${DATASET}.${TABLE}" \
             "$FILE"
 
-          echo "Carga terminada."
+          echo "OK. Tabla lista."
