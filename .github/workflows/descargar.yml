@@ -1,4 +1,4 @@
-name: Descargar CSV SEACE y subir a BigQuery (1 mes)
+name: Descargar CSV SEACE y cargar a BigQuery (1 mes)
 
 on:
   workflow_dispatch: {}
@@ -8,61 +8,117 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # Paso 1: Checkout
+      # Paso 1: Checkout (para que exista la carpeta del repo)
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Paso 2: Autenticación Google
+      # Paso 2: Auth Google con tu Service Account (key en secrets)
       - name: Auth Google
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      # Paso 3: Setup gcloud + bq
+      # Paso 3: Setup gcloud (incluye bq)
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: heroic-ruler-481618-e5
 
-      # Paso 4: Limpiar carpeta data (IGUAL que con JSON)
+      # Paso 4: Limpiar carpeta data
       - name: Limpiar carpeta data
+        shell: bash
         run: |
-          set -e
+          set -euxo pipefail
           mkdir -p data
-          rm -f data/*.json data/*.csv data/*.zip || true
-          echo "Contenido de data después de limpiar:"
-          ls -lh data
+          rm -f data/*.csv data/*.json data/*.zip || true
+          rm -f data/* || true
+          echo "data/ después de limpiar:"
+          ls -lah data
 
-      # Paso 5: Descargar CSV (MISMA carpeta data)
+      # Paso 5: Descargar CSV (1 mes) en data/
       - name: Descargar CSV SEACE
+        shell: bash
         run: |
-          set -e
+          set -euxo pipefail
 
-          curl -L -f \
-            "https://contratacionesabiertas.oece.gob.pe/api/v1/file/seace_v3/csv/2026/01" \
-            -o data/seace_v3_2026_01.csv
+          YEAR="2026"
+          MONTH="01"
 
-          # Validación básica
-          test -s data/seace_v3_2026_01.csv
+          URL="https://contratacionesabiertas.oece.gob.pe/api/v1/file/seace_v3/csv/${YEAR}/${MONTH}"
+          OUT="data/seace_v3_${YEAR}_${MONTH}.csv"
 
-          echo "CSV descargado:"
-          ls -lh data/seace_v3_2026_01.csv
-          head -n 5 data/seace_v3_2026_01.csv
+          echo "Descargando: $URL"
+          curl -L -f -sS "$URL" -o "$OUT"
 
-      # Paso 6: Cargar CSV a BigQuery (como el JSON)
+          echo "Archivo descargado:"
+          ls -lh "$OUT"
+
+          echo "Tipo de archivo (debe decir text/csv o similar):"
+          file "$OUT"
+
+          echo "Primeras 5 líneas:"
+          head -n 5 "$OUT"
+
+      # Paso 6: Diagnóstico: contar NULs (ASCII 0) y limpiar si aparecen
+      - name: Detectar y limpiar ASCII 0 (NUL) si existe
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          IN="data/seace_v3_2026_01.csv"
+          CLEAN="data/seace_v3_2026_01_clean.csv"
+
+          python - <<'PY'
+          p="data/seace_v3_2026_01.csv"
+          b=open(p,"rb").read()
+          print("Bytes:", len(b))
+          print("NULs:", b.count(b"\x00"))
+          PY
+
+          # Si hay NULs, los quitamos. Si no hay, usamos el original.
+          NULS=$(python - <<'PY'
+          b=open("data/seace_v3_2026_01.csv","rb").read()
+          print(b.count(b"\x00"))
+          PY
+          )
+
+          if [ "$NULS" != "0" ]; then
+            echo "Se detectaron NULs ($NULS). Limpiando con tr..."
+            tr -d '\000' < "$IN" > "$CLEAN"
+            test -s "$CLEAN"
+            echo "Limpio creado: $CLEAN"
+          else
+            echo "No hay NULs. Copiando original como clean para flujo uniforme."
+            cp "$IN" "$CLEAN"
+          fi
+
+          echo "Preview (primeras 3 líneas del clean):"
+          head -n 3 "$CLEAN"
+
+      # Paso 7: Cargar a BigQuery (con flags tolerantes para CSV grande)
       - name: Cargar CSV a BigQuery
+        shell: bash
         run: |
-          set -e
+          set -euxo pipefail
 
           PROJECT_ID="heroic-ruler-481618-e5"
           DATASET="github_actions"
           TABLE="seace_v3_2026_01"
+          FILE="data/seace_v3_2026_01_clean.csv"
 
-          bq load \
-            --project_id="$PROJECT_ID" \
+          echo "Cargando a: ${PROJECT_ID}:${DATASET}.${TABLE}"
+          echo "Usando archivo: $FILE"
+          ls -lh "$FILE"
+
+          bq --project_id="$PROJECT_ID" load \
             --source_format=CSV \
             --autodetect \
             --skip_leading_rows=1 \
+            --allow_quoted_newlines \
+            --allow_jagged_rows \
+            --max_bad_records=5000 \
             --replace \
             "${DATASET}.${TABLE}" \
-            data/seace_v3_2026_01.csv
+            "$FILE"
+
+          echo "Carga terminada."
