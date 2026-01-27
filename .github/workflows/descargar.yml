@@ -1,4 +1,4 @@
-name: SEACE CSV ZIP -> BigQuery (3 meses, NO descarta filas, views por columnas comunes)
+name: SEACE CSV ZIP -> BigQuery (3 meses + carga estricta + views + conteo REAL)
 
 on:
   workflow_dispatch: {}
@@ -26,12 +26,20 @@ jobs:
         with:
           project_id: heroic-ruler-481618-e5
 
-      # Paso 0: Crear dataset si no existe
-      - name: Crear dataset si no existe
+      # Paso 0: Verificación rápida de permisos (si esto falla, no sigas perdiendo tiempo)
+      - name: Verificar acceso BigQuery (jobs + dataset)
         shell: bash
         run: |
           set -euxo pipefail
+          bq --project_id="$PROJECT_ID" ls >/dev/null
+          echo "OK: bq ls funciona (permiso básico)."
+
+          # Crear dataset si no existe
           bq --project_id="$PROJECT_ID" mk --dataset "$PROJECT_ID:$DATASET" || true
+
+          # Query mínima para verificar jobs/query perms
+          bq --project_id="$PROJECT_ID" query --use_legacy_sql=false "SELECT 1" >/dev/null
+          echo "OK: bq query funciona (permiso jobs)."
 
       # Paso 1: Limpieza runner
       - name: Limpiar data/ y tmp/ (runner)
@@ -98,7 +106,7 @@ jobs:
             with zipfile.ZipFile(zip_path, "r") as z:
               z.extractall(out_dir)
 
-            csv_files = sorted(out_dir.glob("*.csv"))
+            csv_files = sorted(out_dir.glob('*.csv'))
             if not csv_files:
               raise SystemExit(f"No hay CSVs en {zip_path}")
 
@@ -132,8 +140,8 @@ jobs:
           set -euxo pipefail
           sed -n '1,250p' tmp/conteo_csv_real.txt
 
-      # Paso 3: Normalizar headers + guardar en data/ + cargar a BQ (SIN descartar filas) con heartbeat
-      - name: Normalizar headers + cargar a BigQuery (NO descarta filas, con heartbeat)
+      # Paso 3: Normalizar headers + guardar en data/ + cargar a BQ (SIN descartar filas) con wait robusto
+      - name: Normalizar headers + cargar a BigQuery (NO descarta filas, wait robusto)
         shell: bash
         run: |
           set -euxo pipefail
@@ -152,8 +160,7 @@ jobs:
 
           def normalize_headers_line(header: str):
             cols = header.rstrip("\n\r").split(",")
-            fixed = []
-            seen = {}
+            fixed, seen = [], {}
             for c in cols:
               c = c.strip()
               c = c.replace("/", "_").replace(" ", "_").replace("-", "_")
@@ -176,30 +183,42 @@ jobs:
             return r.returncode, r.stdout
 
           def bq_show_job(job_id: str) -> dict:
-            cmd = ["bq", f"--project_id={PROJECT_ID}", "show", "--format=prettyjson", job_id]
+            full_job = f"{PROJECT_ID}:{job_id}"
+            cmd = ["bq", f"--project_id={PROJECT_ID}", "show", "--format=prettyjson", full_job]
             rc, out = run_capture(cmd)
             if rc != 0:
-              return {"_error": out}
+              return {"_error": out, "_full_job": full_job}
             try:
               return json.loads(out)
             except Exception:
-              return {"_raw": out}
+              return {"_raw": out, "_full_job": full_job}
 
-          def wait_job(job_id: str, heartbeat_s: int = 20):
+          def wait_job(job_id: str, heartbeat_s: int = 20, max_show_failures: int = 3) -> bool:
             start = time.time()
             last_state = None
+            show_failures = 0
 
             while True:
               info = bq_show_job(job_id)
+
               if "_error" in info:
+                show_failures += 1
                 elapsed = int(time.time() - start)
-                print(f"[HB] job={job_id} elapsed={elapsed}s (no pude leer estado)")
+                print(f"[HB] job={info.get('_full_job', job_id)} elapsed={elapsed}s (bq show FALLÓ {show_failures}/{max_show_failures})")
+                print(info["_error"])
+
+                if show_failures >= max_show_failures:
+                  print("[FATAL] No puedo leer el estado del job. Esto es job_id mal formado o permisos de jobs.")
+                  return False
+
                 time.sleep(heartbeat_s)
                 continue
 
+              show_failures = 0
+
               state = info.get("status", {}).get("state", "UNKNOWN")
               if state != last_state:
-                print(f"[JOB] {job_id} estado={state}")
+                print(f"[JOB] {PROJECT_ID}:{job_id} estado={state}")
                 last_state = state
 
               elapsed = int(time.time() - start)
@@ -207,7 +226,7 @@ jobs:
               if state == "DONE":
                 err = info.get("status", {}).get("errorResult")
                 if err:
-                  print(f"[ERROR] Job {job_id} terminó con error: {err}")
+                  print(f"[ERROR] Job {PROJECT_ID}:{job_id} terminó con error: {err}")
                   errs = info.get("status", {}).get("errors", [])
                   if errs:
                     print("[ERROR] Detalle errores (primeros 20):")
@@ -215,17 +234,15 @@ jobs:
                       print(e)
                   return False
 
-                # outputRows (si aparece)
                 stats = info.get("statistics", {}).get("load", {})
                 out_rows = stats.get("outputRows")
                 if out_rows is not None:
-                  print(f"[OK] Job {job_id} DONE en {elapsed}s, outputRows={out_rows}")
+                  print(f"[OK] DONE en {elapsed}s, outputRows={out_rows}")
                 else:
-                  print(f"[OK] Job {job_id} DONE en {elapsed}s")
-
+                  print(f"[OK] DONE en {elapsed}s")
                 return True
 
-              print(f"[HB] job={job_id} estado={state} elapsed={elapsed}s (BigQuery sigue...)")
+              print(f"[HB] job={PROJECT_ID}:{job_id} estado={state} elapsed={elapsed}s (BigQuery sigue...)")
               time.sleep(heartbeat_s)
 
           created = []
@@ -241,14 +258,12 @@ jobs:
               continue
 
             for src in csv_paths:
-              name_no_ext = src.stem
-
-              table_base = re.sub(r"[^A-Za-z0-9_]", "_", name_no_ext)
+              table_base = re.sub(r"[^A-Za-z0-9_]", "_", src.stem)
               table_base = re.sub(r"_+", "_", table_base).strip("_") or "tabla"
               if table_base[0].isdigit():
                 table_base = "t_" + table_base
 
-              table = f"{table_base}_{suffix}"      # records_2026_01
+              table = f"{table_base}_{suffix}"
               out_clean = data / f"{table}.csv"
 
               b = src.read_bytes().replace(b"\x00", b"")
@@ -263,18 +278,9 @@ jobs:
                 g.writelines(lines)
 
               full_table = f"{DATASET}.{table}"
-              size_mb = out_clean.stat().st_size / (1024*1024)
-              print("\n====================================================")
-              print(f"LOAD {ym} {src.name} -> {PROJECT_ID}:{full_table}")
-              print(f"CSV limpio: {out_clean} size={size_mb:.2f} MB")
-              print("Regla: NO se descartan filas. Si hay error, falla.")
-              print("====================================================")
 
               job_id = re.sub(r"[^A-Za-z0-9_]", "_", f"load_{table}_{int(time.time())}")
 
-              # CLAVE: NO descartar filas
-              # - max_bad_records=0
-              # - sin allow_jagged_rows
               cmd = [
                 "bq", f"--project_id={PROJECT_ID}", "load",
                 "--job_id", job_id,
@@ -289,25 +295,30 @@ jobs:
                 str(out_clean)
               ]
 
+              print("\n====================================================")
+              print(f"START LOAD {ym} {src.name} -> {PROJECT_ID}:{full_table}")
+              print(f"JOB: {PROJECT_ID}:{job_id}")
+              print("Regla: NO se descartan filas. Si hay error, falla.")
+              print("====================================================")
+
               rc, out = run_capture(cmd)
               print(out)
               if rc != 0:
-                print(f"[ERROR] No pude iniciar el job {job_id} para {full_table}")
                 sys.exit(rc)
 
               ok = wait_job(job_id, heartbeat_s=20)
               if not ok:
-                print(f"[ERROR] Falló job {job_id} cargando {full_table}")
+                print(f"[ERROR] Falló carga {PROJECT_ID}:{full_table}")
                 sys.exit(1)
 
               created.append(f"{PROJECT_ID}.{full_table}")
 
           (tmp / "created_tables.txt").write_text("\n".join(created) + "\n", encoding="utf-8")
-          print("\nOK: Tablas mensuales cargadas SIN descartar filas.")
+          print("\nOK: Tablas mensuales cargadas sin descartar filas.")
           PY
 
-      # Paso 4: Crear views base (solo tablas existentes, solo columnas comunes)
-      - name: Crear/Actualizar views base (tablas existentes + columnas comunes)
+      # Paso 4: Views por familia (solo tablas existentes + solo columnas comunes)
+      - name: Crear/Actualizar views (tablas existentes + columnas comunes)
         shell: bash
         run: |
           set -euxo pipefail
@@ -328,10 +339,8 @@ jobs:
             WHERE table_type = 'BASE TABLE'
               AND REGEXP_CONTAINS(table_name, r'_[0-9]{4}_[0-9]{2}$')
           ) DO
-
             SET base_name = fam.base;
 
-            -- SOLO tablas existentes de esa familia
             SET tables = (
               SELECT ARRAY_AGG(table_name ORDER BY table_name)
               FROM `heroic-ruler-481618-e5.github_actions.INFORMATION_SCHEMA.TABLES`
@@ -343,7 +352,6 @@ jobs:
               CONTINUE;
             END IF;
 
-            -- SOLO columnas comunes (si hay columnas extra, se ignoran)
             SET common_cols = (
               SELECT ARRAY_AGG(column_name ORDER BY column_name)
               FROM (
@@ -376,16 +384,14 @@ jobs:
               'CREATE OR REPLACE VIEW `%s.%s.%s` AS %s',
               project_id, dataset_id, base_name, union_sql
             );
-
           END FOR;
           SQL
 
-      # Paso 5: Verificación en BigQuery (conteo por tabla mensual + view records)
-      - name: Verificar conteos en BigQuery (tablas mensuales + view records)
+      # Paso 5: Conteo en BigQuery
+      - name: Verificar conteos en BigQuery (tablas creadas + view records)
         shell: bash
         run: |
           set -euxo pipefail
-
           echo "Tablas creadas:"
           cat tmp/created_tables.txt || true
 
@@ -398,42 +404,22 @@ jobs:
             cmd = ["bq", f"--project_id={PROJECT_ID}", "query", "--use_legacy_sql=false", "--format=csv", sql]
             r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             if r.returncode != 0:
-              return "ERR\n" + r.stdout
+              print(r.stdout)
+              return ""
             return r.stdout
 
           def count_table(full: str) -> int:
-            sql = f"SELECT COUNT(1) AS c FROM `{full}`"
-            out = bq_query(sql)
+            out = bq_query(f"SELECT COUNT(1) AS c FROM `{full}`")
             lines = [x.strip() for x in out.splitlines() if x.strip()]
             if len(lines) >= 2 and lines[0] == "c":
               return int(lines[1])
             return -1
 
-          total = 0
-          try:
-            tables = [ln.strip() for ln in open("tmp/created_tables.txt", "r", encoding="utf-8") if ln.strip()]
-          except FileNotFoundError:
-            tables = []
-
+          tables = [ln.strip() for ln in open("tmp/created_tables.txt", "r", encoding="utf-8") if ln.strip()]
           print("\n--- Conteo por tabla mensual ---")
           for t in tables:
-            c = count_table(t)
-            print(f"{t} -> {c}")
-            if c > 0:
-              total += c
-
-          print(f"\nTOTAL filas (suma de tablas mensuales cargadas): {total}")
+            print(t, "->", count_table(t))
 
           view = f"{PROJECT_ID}.github_actions.records"
-          c_view = count_table(view)
-          if c_view >= 0:
-            print(f"\nVIEW {view} -> {c_view} filas")
-          else:
-            print(f"\nVIEW {view} no existe o no se pudo contar.")
+          print("\nVIEW records ->", count_table(view))
           PY
-
-      - name: Ver data/ (solo depurar)
-        shell: bash
-        run: |
-          set -euxo pipefail
-          ls -lah data || true
