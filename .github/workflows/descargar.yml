@@ -1,170 +1,442 @@
-name: SEACE CSV ZIP -> BigQuery (3 meses FINAL)
+name: SEACE CSV ZIP -> BigQuery (3 meses, TODO TEXTO, sin perder filas, heartbeat, views)
 
 on:
   workflow_dispatch: {}
 
 jobs:
-  seace_final:
+  seace_3m_text:
     runs-on: ubuntu-latest
 
     env:
       PROJECT_ID: heroic-ruler-481618-e5
       DATASET: github_actions
       MONTHS: "2025-11 2025-12 2026-01"
+      PYTHONUNBUFFERED: "1"
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout (chék-aut)
+        uses: actions/checkout@v4
 
-      - name: Auth Google
+      - name: Auth Google (gú-gol)
         uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
-      - name: Setup gcloud
+      - name: Setup gcloud (yi-kláud)
         uses: google-github-actions/setup-gcloud@v2
         with:
           project_id: heroic-ruler-481618-e5
 
-      - name: Crear dataset si no existe
+      # Paso 0: Crear dataset si no existe (NO borra dataset)
+      - name: Crear dataset si no existe (déita-set)
+        shell: bash
         run: |
+          set -euxo pipefail
           bq --project_id="$PROJECT_ID" mk --dataset "$PROJECT_ID:$DATASET" || true
 
-      - name: Limpiar runner
+      # Paso 1: Limpieza runner
+      - name: Limpiar runner (data/ tmp/)
+        shell: bash
         run: |
-          mkdir -p tmp data
-          rm -rf tmp/* data/*
+          set -euxo pipefail
+          mkdir -p data tmp
+          rm -rf data/* || true
+          rm -rf tmp/*  || true
+          echo "Runner limpio."
 
-      # -------------------------------------------------------
-      # 1) DESCARGA + CONTEO REAL
-      # -------------------------------------------------------
-      - name: Descargar ZIPs y contar filas reales
+      # Paso 2: Descargar ZIPs + extraer CSVs + conteo REAL por CSV
+      - name: Descargar ZIPs + extraer + conteo REAL (CSV)
+        shell: bash
         run: |
-          python - <<'PY'
-          import os, zipfile, csv
+          set -euxo pipefail
+          python -u - <<'PY'
+          import os, zipfile, subprocess, csv
           from pathlib import Path
+          from io import StringIO
 
           MONTHS = os.environ["MONTHS"].split()
           tmp = Path("tmp"); tmp.mkdir(exist_ok=True)
 
-          def count_rows(csv_path):
-              with open(csv_path, newline='', encoding='utf-8', errors='replace') as f:
-                  r = csv.reader(f)
-                  next(r, None)
-                  return sum(1 for _ in r)
+          def sh(cmd: str):
+              r = subprocess.run(["bash","-lc", cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              if r.returncode != 0:
+                  print(r.stdout, flush=True)
+                  raise SystemExit(r.returncode)
+              return r.stdout
 
-          total_all = 0
+          def count_csv_rows(path: Path) -> int:
+              b = path.read_bytes().replace(b"\x00", b"")
+              text = b.decode("utf-8", errors="replace")
+              f = StringIO(text, newline="")
+              reader = csv.reader(f)
+              header = next(reader, None)
+              if header is None:
+                  return 0
+              rows = 0
+              for _ in reader:
+                  rows += 1
+              return rows
+
+          out_lines = ["mes\tarchivo\trows\tsize_kb"]
+          expected = ["table\tmes\texpected_rows"]
 
           for ym in MONTHS:
-              y,m = ym.split("-")
+              y, m = ym.split("-")
               url = f"https://contratacionesabiertas.oece.gob.pe/api/v1/file/seace_v3/csv/{y}/{m}"
-              zipf = tmp / f"seace_{y}_{m}.zip"
-              out  = tmp / f"unzipped_{y}_{m}"
-              os.system(f"curl -L -sS '{url}' -o '{zipf}'")
-              out.mkdir(exist_ok=True)
+              zip_path = tmp / f"seace_{y}_{m}.zip"
+              out_dir  = tmp / f"unzipped_{y}_{m}"
+              out_dir.mkdir(parents=True, exist_ok=True)
 
-              with zipfile.ZipFile(zipf) as z:
-                  z.extractall(out)
+              print(f"\n=== MES {ym} ===", flush=True)
+              print(f"URL: {url}", flush=True)
 
-              print(f"\nMES {ym}")
+              sh(f"curl -L -f -sS '{url}' -o '{zip_path}'")
+              if zip_path.stat().st_size == 0:
+                  raise SystemExit(f"ZIP vacío: {zip_path}")
+
+              with zipfile.ZipFile(zip_path, "r") as z:
+                  z.extractall(out_dir)
+
+              csvs = sorted(out_dir.glob('*.csv'))
+              if not csvs:
+                  raise SystemExit(f"No hay CSV dentro del ZIP: {zip_path}")
+
               month_sum = 0
-              for f in sorted(out.glob("*.csv")):
-                  c = count_rows(f)
-                  month_sum += c
-                  print(f"{f.name:35s} rows={c}")
-              total_all += month_sum
-              print(f"TOTAL MES {ym}: {month_sum}")
+              for f in csvs:
+                  rows = count_csv_rows(f)
+                  size_kb = f.stat().st_size / 1024
+                  month_sum += rows
+                  print(f"{f.name:45s} rows={rows:10d} size_kb={size_kb:12.1f}", flush=True)
+                  out_lines.append(f"{ym}\t{f.name}\t{rows}\t{size_kb:.1f}")
 
-          print(f"\nTOTAL 3 MESES: {total_all}")
+                  # tabla base = nombre del CSV sin extensión
+                  expected.append(f"{f.stem}\t{ym}\t{rows}")
+
+              print(f"TOTAL filas (suma CSV mes {ym}): {month_sum}", flush=True)
+
+          (tmp/"conteo_csv_real.txt").write_text("\n".join(out_lines)+"\n", encoding="utf-8")
+          (tmp/"expected_rows.tsv").write_text("\n".join(expected)+"\n", encoding="utf-8")
+          print("\nOK: tmp/conteo_csv_real.txt y tmp/expected_rows.tsv creados", flush=True)
           PY
 
-      # -------------------------------------------------------
-      # 2) CARGA A BIGQUERY (SIN DESCARTAR FILAS)
-      # -------------------------------------------------------
-      - name: Cargar CSVs a BigQuery (espera real)
+      - name: Mostrar conteo (primeras 200 líneas)
+        shell: bash
         run: |
-          python - <<'PY'
-          import os, re, time, subprocess
+          set -euxo pipefail
+          sed -n '1,200p' tmp/conteo_csv_real.txt
+
+      # Paso 3: Normalizar headers + generar schema TODO STRING + guardar CSV limpio en data/
+      - name: Normalizar headers + schema TODO STRING + guardar en data/
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -u - <<'PY'
+          import os, re, json
           from pathlib import Path
 
-          PROJECT = os.environ["PROJECT_ID"]
-          DATASET = os.environ["DATASET"]
-          MONTHS  = os.environ["MONTHS"].split()
-
+          MONTHS = os.environ["MONTHS"].split()
           tmp  = Path("tmp")
-          data = Path("data"); data.mkdir(exist_ok=True)
+          data = Path("data")
+          data.mkdir(exist_ok=True)
 
-          def norm(h):
+          def norm_name(s: str) -> str:
+              s = s.strip().replace("/", "_").replace(" ", "_").replace("-", "_")
+              s = re.sub(r"[^A-Za-z0-9_]", "_", s)
+              s = re.sub(r"_+", "_", s).strip("_")
+              if not s:
+                  s = "col"
+              if s[0].isdigit():
+                  s = "c_" + s
+              return s
+
+          def normalize_header(header_line: str):
+              cols = header_line.rstrip("\n\r").split(",")
+              fixed = []
               seen = {}
-              out = []
-              for c in h.rstrip().split(","):
-                  c = re.sub(r"[^A-Za-z0-9_]", "_", c.strip())
-                  c = re.sub(r"_+", "_", c).strip("_") or "col"
-                  if c[0].isdigit(): c = "c_" + c
-                  i = seen.get(c,0)
-                  seen[c]=i+1
-                  out.append(c if i==0 else f"{c}_{i}")
-              return ",".join(out)+"\n"
+              for c in cols:
+                  c = norm_name(c)
+                  k = seen.get(c, 0)
+                  seen[c] = k + 1
+                  if k > 0:
+                      c = f"{c}_{k}"
+                  fixed.append(c)
+              return fixed
+
+          written = 0
+          schemas = 0
 
           for ym in MONTHS:
-              y,m = ym.split("-")
-              src = tmp / f"unzipped_{y}_{m}"
+              y, m = ym.split("-")
+              suffix = f"{y}_{m}"
+              src_dir = tmp / f"unzipped_{y}_{m}"
+              for src in sorted(src_dir.glob("*.csv")):
+                  table_base = norm_name(src.stem)
+                  table = f"{table_base}_{suffix}"
 
-              for csvf in sorted(src.glob("*.csv")):
-                  base = re.sub(r"[^A-Za-z0-9_]", "_", csvf.stem)
-                  table = f"{base}_{y}_{m}"
-                  clean = data / f"{table}.csv"
+                  b = src.read_bytes().replace(b"\x00", b"")
+                  text = b.decode("utf-8", errors="replace").splitlines(True)
+                  if not text:
+                      continue
 
-                  lines = csvf.read_text(errors="replace").splitlines(True)
-                  lines[0] = norm(lines[0])
-                  clean.write_text("".join(lines))
+                  # Header
+                  header_cols = normalize_header(text[0])
+                  text[0] = ",".join(header_cols) + "\n"
 
-                  job = f"load_{table}_{int(time.time())}"
+                  # Guardar CSV limpio
+                  out_csv = data / f"{table}.csv"
+                  out_csv.write_text("".join(text), encoding="utf-8", newline="")
+
+                  # Schema TODO STRING (BigQuery)
+                  schema = [{"name": c, "type": "STRING", "mode": "NULLABLE"} for c in header_cols]
+                  out_schema = data / f"{table}.schema.json"
+                  out_schema.write_text(json.dumps(schema, ensure_ascii=False), encoding="utf-8")
+
+                  written += 1
+                  schemas += 1
+                  if written % 5 == 0:
+                      print(f"[OK] CSVs limpios: {written} | schemas: {schemas}", flush=True)
+
+          print(f"[OK] Total CSVs limpios: {written} | Total schemas: {schemas}", flush=True)
+          PY
+
+      - name: Ver data/ (muestra)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ls -lah data | head -n 80
+
+      # Paso 4: Cargar a BigQuery (TODO STRING, sin perder filas) + heartbeat + validar outputRows vs conteo esperado
+      - name: Cargar a BigQuery (TODO TEXTO, max_bad_records=0, heartbeat, validación)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -u - <<'PY'
+          import os, re, sys, time, json, subprocess
+          from pathlib import Path
+
+          PROJECT_ID = os.environ["PROJECT_ID"]
+          DATASET    = os.environ["DATASET"]
+          MONTHS     = os.environ["MONTHS"].split()
+
+          tmp  = Path("tmp")
+          data = Path("data")
+
+          # Leer esperados (filas reales por CSV fuente)
+          expected_map = {}  # key: (table_base, ym) -> rows
+          for ln in (tmp/"expected_rows.tsv").read_text(encoding="utf-8").splitlines()[1:]:
+              if not ln.strip():
+                  continue
+              table_base, ym, rows = ln.split("\t")
+              expected_map[(table_base, ym)] = int(rows)
+
+          def run_capture(cmd):
+              r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              return r.returncode, r.stdout
+
+          def bq_show_job(job_full: str) -> dict:
+              cmd = ["bq", f"--project_id={PROJECT_ID}", "show", "--job", "--format=prettyjson", job_full]
+              rc, out = run_capture(cmd)
+              if rc != 0:
+                  return {"_error": out}
+              try:
+                  return json.loads(out)
+              except Exception:
+                  return {"_raw": out}
+
+          def wait_job(job_full: str, heartbeat_s: int = 20) -> tuple[bool, int|None]:
+              start = time.time()
+              last_state = None
+              while True:
+                  info = bq_show_job(job_full)
+
+                  if "_error" in info:
+                      elapsed = int(time.time() - start)
+                      print(f"[HB] job={job_full} elapsed={elapsed}s (no pude leer estado todavía)", flush=True)
+                      # imprimimos solo un pedazo para no llenar logs
+                      print(info["_error"][:400], flush=True)
+                      time.sleep(heartbeat_s)
+                      continue
+
+                  state = info.get("status", {}).get("state", "UNKNOWN")
+                  if state != last_state:
+                      print(f"[JOB] {job_full} state={state}", flush=True)
+                      last_state = state
+
+                  elapsed = int(time.time() - start)
+
+                  if state == "DONE":
+                      err = info.get("status", {}).get("errorResult")
+                      if err:
+                          print(f"[ERROR] {job_full} DONE con error: {err}", flush=True)
+                          errs = info.get("status", {}).get("errors", [])
+                          for e in errs[:10]:
+                              print(e, flush=True)
+                          return False, None
+
+                      out_rows = info.get("statistics", {}).get("load", {}).get("outputRows")
+                      print(f"[OK] DONE en {elapsed}s outputRows={out_rows}", flush=True)
+                      return True, (int(out_rows) if out_rows is not None else None)
+
+                  print(f"[HB] job={job_full} state={state} elapsed={elapsed}s (BigQuery sigue...)", flush=True)
+                  time.sleep(heartbeat_s)
+
+          created = []
+
+          for ym in MONTHS:
+              y, m = ym.split("-")
+              suffix = f"{y}_{m}"
+
+              # Para este mes, cargamos todos los CSV limpios cuyo nombre termine en _YYYY_MM.csv
+              month_csvs = sorted(data.glob(f"*_{suffix}.csv"))
+              if not month_csvs:
+                  print(f"[WARN] No hay CSV limpios para {ym} en data/", flush=True)
+                  continue
+
+              print(f"\n=== CARGA MES {ym} | archivos={len(month_csvs)} ===", flush=True)
+
+              for csv_path in month_csvs:
+                  table = csv_path.stem  # ej: records_2025_11
+                  schema_path = data / f"{table}.schema.json"
+                  if not schema_path.exists():
+                      print(f"[FATAL] Falta schema: {schema_path}", flush=True)
+                      sys.exit(1)
+
+                  full_table = f"{DATASET}.{table}"
+
+                  # job_id limpio (sin project dentro)
+                  job_id = re.sub(r"[^A-Za-z0-9_]", "_", f"load_{table}_{int(time.time())}")
+                  job_full = f"{PROJECT_ID}:{job_id}"
+
+                  # Carga: TODO STRING (schema json), sin descartar filas
                   cmd = [
-                      "bq", f"--project_id={PROJECT}",
-                      "load",
-                      "--job_id", job,
+                      "bq", f"--project_id={PROJECT_ID}", "load",
+                      "--job_id", job_id,
                       "--nosync",
                       "--source_format=CSV",
                       "--skip_leading_rows=1",
-                      "--autodetect",
+                      "--allow_quoted_newlines",
                       "--max_bad_records=0",
                       "--replace",
-                      f"{DATASET}.{table}",
-                      str(clean)
+                      full_table,
+                      str(csv_path),
+                      str(schema_path)
                   ]
 
-                  subprocess.run(cmd, check=True)
-                  print(f"[START] {job}")
+                  print("\n====================================================", flush=True)
+                  print(f"START LOAD {ym} -> {PROJECT_ID}:{full_table}", flush=True)
+                  print(f"Archivo: {csv_path.name}", flush=True)
+                  print(f"Schema:  {schema_path.name} (TODO STRING)", flush=True)
+                  print(f"JOB:     {job_full}", flush=True)
+                  print("Regla: NO se descartan filas. Si hay error, falla.", flush=True)
+                  print("====================================================", flush=True)
 
-                  while True:
-                      r = subprocess.run(
-                          ["bq", f"--project_id={PROJECT}", "wait", "-j", f"{PROJECT}:{job}"],
-                          capture_output=True
-                      )
-                      if r.returncode == 0:
-                          print(f"[OK] {job}")
-                          break
-                      print(f"[HB] {job} sigue...")
-                      time.sleep(20)
+                  rc, out = run_capture(cmd)
+                  print(out, flush=True)
+                  if rc != 0:
+                      sys.exit(rc)
+
+                  ok, out_rows = wait_job(job_full, heartbeat_s=20)
+                  if not ok:
+                      print(f"[FATAL] Falló carga {PROJECT_ID}:{full_table}", flush=True)
+                      sys.exit(1)
+
+                  # Validación: outputRows debe coincidir con conteo esperado del CSV original (por tabla base y mes)
+                  # table_base = sin suffix
+                  table_base = re.sub(rf"_{suffix}$", "", table)
+                  expected = expected_map.get((table_base, ym))
+
+                  if expected is None:
+                      print(f"[WARN] No tengo expected_rows para {table_base} {ym}. No valido.", flush=True)
+                  else:
+                      if out_rows is None:
+                          print(f"[WARN] No pude leer outputRows. Validación parcial omitida.", flush=True)
+                      else:
+                          if out_rows != expected:
+                              print(f"[FATAL] MISMATCH filas: {full_table} outputRows={out_rows} esperado={expected}", flush=True)
+                              sys.exit(1)
+                          print(f"[OK] Validación filas OK: {full_table} = {out_rows}", flush=True)
+
+                  created.append(f"{PROJECT_ID}.{full_table}")
+
+          (tmp/"created_tables.txt").write_text("\n".join(created)+"\n", encoding="utf-8")
+          print("\nOK: Cargas terminadas y validadas.", flush=True)
           PY
 
-      # -------------------------------------------------------
-      # 3) CREAR VIEWS BASE
-      # -------------------------------------------------------
-      - name: Crear views base
+      # Paso 5: Crear views base uniendo tablas mensuales por familia (columnas comunes)
+      - name: Crear views base (UNION ALL por familia, solo columnas comunes)
+        shell: bash
         run: |
-          bq --project_id="$PROJECT_ID" query --use_legacy_sql=false "
-          DECLARE p STRING DEFAULT '${PROJECT_ID}';
-          DECLARE d STRING DEFAULT '${DATASET}';
+          set -euxo pipefail
 
-          FOR t IN (
-            SELECT DISTINCT REGEXP_REPLACE(table_name, r'_[0-9]{4}_[0-9]{2}$','') base
+          bq --project_id="$PROJECT_ID" query --use_legacy_sql=false "
+          DECLARE project_id STRING DEFAULT '${PROJECT_ID}';
+          DECLARE dataset_id STRING DEFAULT '${DATASET}';
+
+          FOR fam IN (
+            SELECT DISTINCT REGEXP_REPLACE(table_name, r'_[0-9]{4}_[0-9]{2}$', '') AS base
             FROM \`${PROJECT_ID}.${DATASET}.INFORMATION_SCHEMA.TABLES\`
+            WHERE table_type = 'BASE TABLE'
+              AND REGEXP_CONTAINS(table_name, r'_[0-9]{4}_[0-9]{2}$')
           ) DO
-            EXECUTE IMMEDIATE FORMAT(
-              'CREATE OR REPLACE VIEW `%s.%s.%s` AS
-               SELECT * FROM `%s.%s.%s_*`',
-              p,d,t.base,p,d,t.base
+
+            DECLARE base_name STRING DEFAULT fam.base;
+            DECLARE tables ARRAY<STRING>;
+            DECLARE common_cols ARRAY<STRING>;
+            DECLARE col_list STRING;
+            DECLARE union_sql STRING;
+
+            SET tables = (
+              SELECT ARRAY_AGG(table_name ORDER BY table_name)
+              FROM \`${PROJECT_ID}.${DATASET}.INFORMATION_SCHEMA.TABLES\`
+              WHERE table_type = 'BASE TABLE'
+                AND REGEXP_CONTAINS(table_name, FORMAT(r'^%s_[0-9]{4}_[0-9]{2}$', base_name))
             );
+
+            IF ARRAY_LENGTH(tables) = 0 THEN
+              CONTINUE;
+            END IF;
+
+            SET common_cols = (
+              SELECT ARRAY_AGG(column_name ORDER BY column_name)
+              FROM (
+                SELECT column_name
+                FROM \`${PROJECT_ID}.${DATASET}.INFORMATION_SCHEMA.COLUMNS\`
+                WHERE table_name IN UNNEST(tables)
+                GROUP BY column_name
+                HAVING COUNT(DISTINCT table_name) = ARRAY_LENGTH(tables)
+              )
+            );
+
+            IF ARRAY_LENGTH(common_cols) = 0 THEN
+              CONTINUE;
+            END IF;
+
+            SET col_list = (
+              SELECT STRING_AGG(CONCAT('`', c, '`') ORDER BY c)
+              FROM UNNEST(common_cols) AS c
+            );
+
+            SET union_sql = (
+              SELECT STRING_AGG(
+                CONCAT('SELECT ', col_list, ' FROM `', project_id, '.', dataset_id, '.', t, '`'),
+                ' UNION ALL '
+              )
+              FROM UNNEST(tables) AS t
+            );
+
+            EXECUTE IMMEDIATE CONCAT(
+              'CREATE OR REPLACE VIEW `', project_id, '.', dataset_id, '.', base_name, '` AS ', union_sql
+            );
+
           END FOR;
           "
+
+      # Paso 6: Verificación rápida (view records)
+      - name: Verificar view records (conteo)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          bq --project_id="$PROJECT_ID" query --use_legacy_sql=false --format=pretty "
+          SELECT COUNT(1) AS filas_en_view_records
+          FROM \`${PROJECT_ID}.${DATASET}.records\`
+          " || true
