@@ -1,4 +1,4 @@
-name: SEACE CSV ZIP -> BigQuery (todas las tablas, 1 mes)
+name: SEACE CSV ZIP -> BigQuery (APPEND + year_month, 1 mes)
 
 on:
   workflow_dispatch: {}
@@ -21,7 +21,7 @@ jobs:
         with:
           project_id: heroic-ruler-481618-e5
 
-      # Paso 1: Limpieza REAL
+      # Paso 1: Limpieza REAL de carpetas de trabajo (solo runner, no tu repo)
       - name: Limpiar data/ y tmp/
         shell: bash
         run: |
@@ -30,7 +30,7 @@ jobs:
           rm -rf data/*
           rm -rf tmp/*
           echo "data/ limpio:"
-          ls -lah data
+          ls -lah data || true
 
       # Paso 2: Descargar ZIP SEACE (csv) 1 mes
       - name: Descargar ZIP SEACE (csv)
@@ -39,6 +39,7 @@ jobs:
           set -euxo pipefail
           YEAR="2026"
           MONTH="01"
+          echo "Mes objetivo: ${YEAR}-${MONTH}"
 
           URL="https://contratacionesabiertas.oece.gob.pe/api/v1/file/seace_v3/csv/${YEAR}/${MONTH}"
           ZIP="tmp/seace_${YEAR}_${MONTH}.zip"
@@ -66,8 +67,8 @@ jobs:
           echo "Total CSV: $COUNT"
           test "$COUNT" -gt 0
 
-      # Paso 4: Crear dataset (si existe, no falla) + normalizar headers + cargar a BQ
-      - name: Normalizar headers y cargar cada CSV a BigQuery
+      # Paso 4: Crear dataset (si existe, no falla) + normalizar headers + agregar year_month + APPEND a BQ
+      - name: Normalizar headers + agregar year_month + cargar cada CSV a BigQuery (APPEND)
         shell: bash
         run: |
           set -euxo pipefail
@@ -76,7 +77,7 @@ jobs:
           DATASET="github_actions"
 
           # Crear dataset si no existe (si ya existe, ignora el error)
-          bq --project_id="$PROJECT_ID" mk --dataset "$PROJECT_ID:$DATASET" || true
+          bq --project_id="$PROJECT_ID" mk "$PROJECT_ID:$DATASET" || true
 
           python - <<'PY'
           import os, re, glob, subprocess, sys
@@ -84,14 +85,20 @@ jobs:
           PROJECT_ID = "heroic-ruler-481618-e5"
           DATASET     = "github_actions"
 
+          # Mes que estamos procesando (debe coincidir con el ZIP descargado)
+          YEAR  = "2026"
+          MONTH = "01"
+          YEAR_MONTH = f"{YEAR}-{MONTH}"
+
           def normalize_headers_line(header: str):
               cols = header.rstrip("\n\r").split(",")
               fixed = []
               seen = {}
+
               for c in cols:
                   c = c.strip()
 
-                  # Normalización para BigQuery
+                  # Normalización compatible BigQuery
                   c = c.replace("/", "_")
                   c = c.replace(" ", "_")
                   c = c.replace("-", "_")
@@ -112,6 +119,8 @@ jobs:
 
                   fixed.append(c)
 
+              # Agregar columna de control de mes
+              fixed.append("year_month")
               return ",".join(fixed) + "\n"
 
           csv_paths = sorted(glob.glob("tmp/unzipped/**/*.csv", recursive=True))
@@ -125,7 +134,7 @@ jobs:
               base = os.path.basename(src)
               name_no_ext = os.path.splitext(base)[0]
 
-              # Nombre tabla BigQuery: solo letras/numeros/_ y no empezar con número
+              # Nombre tabla BigQuery
               table = re.sub(r"[^A-Za-z0-9_]", "_", name_no_ext)
               table = re.sub(r"_+", "_", table).strip("_")
               if not table:
@@ -133,26 +142,33 @@ jobs:
               if table[0].isdigit():
                   table = "t_" + table
 
-              out_clean = os.path.join("data", f"{table}.csv")
+              out_clean = os.path.join("data", f"{table}_{YEAR}_{MONTH}.csv")
 
-              # 1) Leer binario y quitar NUL (ASCII 0)
+              # 1) Leer binario y quitar NUL (ASCII 0) por seguridad
               with open(src, "rb") as f:
                   b = f.read().replace(b"\x00", b"")
 
-              # 2) Decodificar tolerante
-              text = b.decode("utf-8", errors="replace").splitlines(True)
-              if not text:
+              # 2) Decodificar tolerante (si hay caracteres raros, no muere)
+              lines = b.decode("utf-8", errors="replace").splitlines(True)
+              if not lines:
                   print(f"[SKIP] {base}: archivo vacío")
                   continue
 
-              # 3) Normalizar header (primera línea)
-              text[0] = normalize_headers_line(text[0])
+              # 3) Normalizar header y agregar year_month
+              lines[0] = normalize_headers_line(lines[0])
 
-              # 4) Guardar CSV listo
+              # 4) Agregar year_month a cada fila (respetando la estructura CSV básica)
+              #    Nota: esto asume que la coma es separador y que cada línea es un registro.
+              #    Si hay saltos de línea dentro de comillas, BigQuery lo tolera con --allow_quoted_newlines.
+              for i in range(1, len(lines)):
+                  ln = lines[i].rstrip("\n\r")
+                  lines[i] = ln + f",{YEAR_MONTH}\n"
+
+              # 5) Guardar CSV listo
               with open(out_clean, "w", encoding="utf-8", newline="") as g:
-                  g.writelines(text)
+                  g.writelines(lines)
 
-              # 5) Cargar a BigQuery (reemplaza tabla)
+              # 6) Cargar a BigQuery (APPEND)
               full_table = f"{DATASET}.{table}"
 
               cmd = [
@@ -163,12 +179,12 @@ jobs:
                   "--allow_quoted_newlines",
                   "--allow_jagged_rows",
                   "--max_bad_records=5000",
-                  "--replace",
+                  # CLAVE: NO --replace => APPEND
                   full_table,
                   out_clean
               ]
 
-              print(f"\n=== Cargando {base} -> {full_table} ===")
+              print(f"\n=== APPEND {base} -> {full_table} ({YEAR_MONTH}) ===")
               r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
               print(r.stdout)
 
@@ -176,10 +192,10 @@ jobs:
                   print(f"[ERROR] Falló carga de {base} -> {full_table}")
                   sys.exit(r.returncode)
 
-          print("\nOK: Todas las tablas cargadas.")
+          print("\nOK: Todas las tablas cargadas (APPEND) con year_month.")
           PY
 
-      # Paso 5: Ver qué quedó (solo para depurar)
+      # Paso 5: Ver qué quedó en data/ (solo para depurar)
       - name: Ver data/
         shell: bash
         run: |
