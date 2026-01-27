@@ -1,11 +1,17 @@
-name: SEACE CSV ZIP -> BigQuery (APPEND + year_month, 1 mes)
+name: SEACE CSV ZIP -> BigQuery (3 meses + carga mensual + views + conteo REAL)
 
 on:
   workflow_dispatch: {}
 
 jobs:
-  seace_zip_to_bq:
+  seace_3months_bq:
     runs-on: ubuntu-latest
+
+    env:
+      PROJECT_ID: heroic-ruler-481618-e5
+      DATASET: github_actions
+      # 3 meses (AÑO-MES)
+      MONTHS: "2025-11 2025-12 2026-01"
 
     steps:
       - name: Checkout (chék-aut)
@@ -21,183 +27,359 @@ jobs:
         with:
           project_id: heroic-ruler-481618-e5
 
-      # Paso 1: Limpieza REAL de carpetas de trabajo (solo runner, no tu repo)
-      - name: Limpiar data/ y tmp/
+      # Paso 0: Dataset existe (no borra dataset)
+      - name: Crear dataset si no existe
+        shell: bash
+        run: |
+          set -euxo pipefail
+          bq --project_id="$PROJECT_ID" mk --dataset "$PROJECT_ID:$DATASET" || true
+
+      # Paso 1: Limpieza runner
+      - name: Limpiar data/ y tmp/ (runner)
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p data tmp
-          rm -rf data/*
-          rm -rf tmp/*
-          echo "data/ limpio:"
-          ls -lah data || true
+          rm -rf data/* || true
+          rm -rf tmp/*  || true
+          echo "Runner limpio."
 
-      # Paso 2: Descargar ZIP SEACE (csv) 1 mes
-      - name: Descargar ZIP SEACE (csv)
+      # Paso 2: Descargar ZIPs + extraer + contar filas CSV REALES (por archivo)
+      - name: Descargar ZIPs + extraer + contar filas CSV reales
         shell: bash
         run: |
           set -euxo pipefail
-          YEAR="2026"
-          MONTH="01"
-          echo "Mes objetivo: ${YEAR}-${MONTH}"
-
-          URL="https://contratacionesabiertas.oece.gob.pe/api/v1/file/seace_v3/csv/${YEAR}/${MONTH}"
-          ZIP="tmp/seace_${YEAR}_${MONTH}.zip"
-
-          curl -L -f -sS "$URL" -o "$ZIP"
-          test -s "$ZIP"
-
-          echo "Tipo de archivo:"
-          file "$ZIP"
-
-          echo "Contenido ZIP (primeros 80):"
-          unzip -l "$ZIP" | head -n 80
-
-      # Paso 3: Extraer TODOS los CSV
-      - name: Extraer CSVs
-        shell: bash
-        run: |
-          set -euxo pipefail
-          unzip -o "tmp/seace_2026_01.zip" -d "tmp/unzipped"
-
-          echo "CSVs encontrados:"
-          find tmp/unzipped -type f -iname "*.csv" -print
-
-          COUNT=$(find tmp/unzipped -type f -iname "*.csv" | wc -l)
-          echo "Total CSV: $COUNT"
-          test "$COUNT" -gt 0
-
-      # Paso 4: Crear dataset (si existe, no falla) + normalizar headers + agregar year_month + APPEND a BQ
-      - name: Normalizar headers + agregar year_month + cargar cada CSV a BigQuery (APPEND)
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          PROJECT_ID="heroic-ruler-481618-e5"
-          DATASET="github_actions"
-
-          # Crear dataset si no existe (si ya existe, ignora el error)
-          bq --project_id="$PROJECT_ID" mk "$PROJECT_ID:$DATASET" || true
 
           python - <<'PY'
-          import os, re, glob, subprocess, sys
+          import os, zipfile, subprocess
+          from pathlib import Path
+          from collections import defaultdict
+          import csv, re
 
-          PROJECT_ID = "heroic-ruler-481618-e5"
-          DATASET     = "github_actions"
+          MONTHS = os.environ["MONTHS"].split()
 
-          # Mes que estamos procesando (debe coincidir con el ZIP descargado)
-          YEAR  = "2026"
-          MONTH = "01"
-          YEAR_MONTH = f"{YEAR}-{MONTH}"
+          tmp = Path("tmp")
+          tmp.mkdir(exist_ok=True)
+
+          def sh(cmd: str):
+              r = subprocess.run(["bash","-lc", cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              if r.returncode != 0:
+                  print(r.stdout)
+                  raise SystemExit(r.returncode)
+              return r.stdout
+
+          def count_csv_rows(path: Path) -> int:
+              # Cuenta filas CSV reales (excluye header), soporta quoted newlines
+              b = path.read_bytes().replace(b"\x00", b"")
+              text = b.decode("utf-8", errors="replace")
+              from io import StringIO
+              f = StringIO(text, newline="")
+              reader = csv.reader(f)
+              header = next(reader, None)
+              if header is None:
+                  return 0
+              rows = 0
+              for _ in reader:
+                  rows += 1
+              return rows
+
+          summary_lines = []
+          total_all_months = 0
+          per_month_total = defaultdict(int)
+
+          for ym in MONTHS:
+              year, month = ym.split("-")
+              url = f"https://contratacionesabiertas.oece.gob.pe/api/v1/file/seace_v3/csv/{year}/{month}"
+              zip_path = tmp / f"seace_{year}_{month}.zip"
+              out_dir  = tmp / f"unzipped_{year}_{month}"
+
+              print(f"\n=== MES {ym} ===")
+              print(f"URL: {url}")
+
+              sh(f"curl -L -f -sS '{url}' -o '{zip_path}'")
+              if zip_path.stat().st_size == 0:
+                  raise SystemExit(f"ZIP vacío: {zip_path}")
+
+              out_dir.mkdir(parents=True, exist_ok=True)
+              with zipfile.ZipFile(zip_path, "r") as z:
+                  z.extractall(out_dir)
+
+              csv_files = sorted(out_dir.glob("*.csv"))
+              print(f"CSVs encontrados: {len(csv_files)}")
+              if not csv_files:
+                  raise SystemExit(f"No hay CSVs en {zip_path}")
+
+              print("\n--- Conteo REAL por CSV (rows, no líneas) ---")
+              month_sum = 0
+              for f in csv_files:
+                  rows = count_csv_rows(f)
+                  size_kb = f.stat().st_size / 1024
+                  month_sum += rows
+                  print(f"{f.name:35s} rows={rows:9d}  size_kb={size_kb:10.1f}")
+                  summary_lines.append(f"{ym}\t{f.name}\t{rows}\t{size_kb:.1f}")
+
+              per_month_total[ym] = month_sum
+              total_all_months += month_sum
+              print(f"\nTOTAL filas (suma de todos los CSV del mes {ym}): {month_sum}")
+
+          # Guardar resumen a archivo
+          out = tmp / "conteo_csv_real.txt"
+          with out.open("w", encoding="utf-8") as w:
+              w.write("mes\tarchivo\trows\tsize_kb\n")
+              for ln in summary_lines:
+                  w.write(ln + "\n")
+              w.write("\nTOTAL_POR_MES\n")
+              for ym in MONTHS:
+                  w.write(f"{ym}\t{per_month_total[ym]}\n")
+              w.write(f"\nGRAN_TOTAL_3MESES\t{total_all_months}\n")
+
+          print(f"\nResumen guardado en: {out}")
+          PY
+
+      - name: Mostrar resumen de conteo CSV real
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "==== tmp/conteo_csv_real.txt (primeras 250 líneas) ===="
+          sed -n '1,250p' tmp/conteo_csv_real.txt
+
+      # Paso 3: Normalizar headers + guardar CSV limpio en data/ + cargar a BQ por mes (REPLACE)
+      - name: Normalizar headers + guardar en data/ + cargar a BigQuery (tablas mensuales)
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python - <<'PY'
+          import os, re, glob, subprocess, sys, csv
+          from pathlib import Path
+
+          PROJECT_ID = os.environ["PROJECT_ID"]
+          DATASET    = os.environ["DATASET"]
+          MONTHS     = os.environ["MONTHS"].split()
+
+          tmp = Path("tmp")
+          data = Path("data")
+          data.mkdir(exist_ok=True)
 
           def normalize_headers_line(header: str):
               cols = header.rstrip("\n\r").split(",")
               fixed = []
               seen = {}
-
               for c in cols:
                   c = c.strip()
-
-                  # Normalización compatible BigQuery
-                  c = c.replace("/", "_")
-                  c = c.replace(" ", "_")
-                  c = c.replace("-", "_")
+                  c = c.replace("/", "_").replace(" ", "_").replace("-", "_")
                   c = re.sub(r"[^A-Za-z0-9_]", "_", c)
                   c = re.sub(r"_+", "_", c).strip("_")
-
                   if not c:
                       c = "col"
                   if c[0].isdigit():
                       c = "c_" + c
-
-                  # Evitar duplicados
                   base = c
                   k = seen.get(base, 0)
                   if k > 0:
                       c = f"{base}_{k}"
                   seen[base] = k + 1
-
                   fixed.append(c)
-
-              # Agregar columna de control de mes
-              fixed.append("year_month")
               return ",".join(fixed) + "\n"
 
-          csv_paths = sorted(glob.glob("tmp/unzipped/**/*.csv", recursive=True))
-          if not csv_paths:
-              print("No se encontraron CSVs para procesar.")
-              sys.exit(1)
-
-          os.makedirs("data", exist_ok=True)
-
-          for src in csv_paths:
-              base = os.path.basename(src)
-              name_no_ext = os.path.splitext(base)[0]
-
-              # Nombre tabla BigQuery
-              table = re.sub(r"[^A-Za-z0-9_]", "_", name_no_ext)
-              table = re.sub(r"_+", "_", table).strip("_")
-              if not table:
-                  table = "tabla"
-              if table[0].isdigit():
-                  table = "t_" + table
-
-              out_clean = os.path.join("data", f"{table}_{YEAR}_{MONTH}.csv")
-
-              # 1) Leer binario y quitar NUL (ASCII 0) por seguridad
-              with open(src, "rb") as f:
-                  b = f.read().replace(b"\x00", b"")
-
-              # 2) Decodificar tolerante (si hay caracteres raros, no muere)
-              lines = b.decode("utf-8", errors="replace").splitlines(True)
-              if not lines:
-                  print(f"[SKIP] {base}: archivo vacío")
-                  continue
-
-              # 3) Normalizar header y agregar year_month
-              lines[0] = normalize_headers_line(lines[0])
-
-              # 4) Agregar year_month a cada fila (respetando la estructura CSV básica)
-              #    Nota: esto asume que la coma es separador y que cada línea es un registro.
-              #    Si hay saltos de línea dentro de comillas, BigQuery lo tolera con --allow_quoted_newlines.
-              for i in range(1, len(lines)):
-                  ln = lines[i].rstrip("\n\r")
-                  lines[i] = ln + f",{YEAR_MONTH}\n"
-
-              # 5) Guardar CSV listo
-              with open(out_clean, "w", encoding="utf-8", newline="") as g:
-                  g.writelines(lines)
-
-              # 6) Cargar a BigQuery (APPEND)
-              full_table = f"{DATASET}.{table}"
-
-              cmd = [
-                  "bq", f"--project_id={PROJECT_ID}", "load",
-                  "--source_format=CSV",
-                  "--autodetect",
-                  "--skip_leading_rows=1",
-                  "--allow_quoted_newlines",
-                  "--allow_jagged_rows",
-                  "--max_bad_records=5000",
-                  # CLAVE: NO --replace => APPEND
-                  full_table,
-                  out_clean
-              ]
-
-              print(f"\n=== APPEND {base} -> {full_table} ({YEAR_MONTH}) ===")
+          def bq(cmd):
               r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
               print(r.stdout)
+              return r.returncode
 
-              if r.returncode != 0:
-                  print(f"[ERROR] Falló carga de {base} -> {full_table}")
-                  sys.exit(r.returncode)
+          created = []
 
-          print("\nOK: Todas las tablas cargadas (APPEND) con year_month.")
+          for ym in MONTHS:
+              year, month = ym.split("-")
+              suffix = f"{year}_{month}"
+              out_dir = tmp / f"unzipped_{year}_{month}"
+
+              csv_paths = sorted(out_dir.glob("*.csv"))
+              if not csv_paths:
+                  print(f"[WARN] No hay CSVs para {ym} en {out_dir}")
+                  continue
+
+              for src in csv_paths:
+                  base = src.name
+                  name_no_ext = src.stem
+
+                  table_base = re.sub(r"[^A-Za-z0-9_]", "_", name_no_ext)
+                  table_base = re.sub(r"_+", "_", table_base).strip("_") or "tabla"
+                  if table_base[0].isdigit():
+                      table_base = "t_" + table_base
+
+                  table = f"{table_base}_{suffix}"   # records_2026_01
+                  out_clean = data / f"{table}.csv"
+
+                  # Leer binario, quitar NUL, decodificar tolerante
+                  b = src.read_bytes().replace(b"\x00", b"")
+                  text = b.decode("utf-8", errors="replace").splitlines(True)
+                  if not text:
+                      print(f"[SKIP] {base}: vacío")
+                      continue
+
+                  # Normalizar header
+                  text[0] = normalize_headers_line(text[0])
+
+                  # Guardar
+                  out_clean.write_text("".join(text), encoding="utf-8", newline="")
+
+                  full_table = f"{DATASET}.{table}"
+
+                  # Cargar (REPLACE). Si pierdes filas, en los logs saldrá "max bad records exceeded"
+                  cmd = [
+                      "bq", f"--project_id={PROJECT_ID}", "load",
+                      "--source_format=CSV",
+                      "--autodetect",
+                      "--skip_leading_rows=1",
+                      "--allow_quoted_newlines",
+                      "--allow_jagged_rows",
+                      "--max_bad_records=5000",
+                      "--replace",
+                      full_table,
+                      str(out_clean)
+                  ]
+
+                  print(f"\n=== LOAD {ym} {base} -> {PROJECT_ID}:{full_table} ===")
+                  rc = bq(cmd)
+                  if rc != 0:
+                      print(f"[ERROR] Falló carga: {full_table}")
+                      sys.exit(rc)
+
+                  created.append(f"{PROJECT_ID}.{full_table}")
+
+          # Guardar lista de tablas creadas
+          (tmp / "created_tables.txt").write_text("\n".join(created) + "\n", encoding="utf-8")
+          print("\nOK: Tablas mensuales cargadas.")
           PY
 
-      # Paso 5: Ver qué quedó en data/ (solo para depurar)
-      - name: Ver data/
+      # Paso 4: Crear views base uniendo tablas mensuales (columnas comunes)
+      - name: Crear/Actualizar views base (UNION ALL por familia, columnas comunes)
         shell: bash
         run: |
           set -euxo pipefail
-          ls -lah data
+
+          bq --project_id="$PROJECT_ID" query --use_legacy_sql=false "
+          DECLARE project_id STRING DEFAULT '${PROJECT_ID}';
+          DECLARE dataset_id STRING DEFAULT '${DATASET}';
+
+          FOR fam IN (
+            SELECT DISTINCT REGEXP_REPLACE(table_name, r'_[0-9]{4}_[0-9]{2}$', '') AS base
+            FROM \`${PROJECT_ID}.${DATASET}.INFORMATION_SCHEMA.TABLES\`
+            WHERE table_type = 'BASE TABLE'
+              AND REGEXP_CONTAINS(table_name, r'_[0-9]{4}_[0-9]{2}$')
+          ) DO
+
+            DECLARE base_name STRING DEFAULT fam.base;
+            DECLARE tables ARRAY<STRING>;
+            DECLARE common_cols ARRAY<STRING>;
+            DECLARE col_list STRING;
+            DECLARE union_sql STRING;
+
+            SET tables = (
+              SELECT ARRAY_AGG(table_name ORDER BY table_name)
+              FROM \`${PROJECT_ID}.${DATASET}.INFORMATION_SCHEMA.TABLES\`
+              WHERE table_type = 'BASE TABLE'
+                AND REGEXP_CONTAINS(table_name, FORMAT(r'^%s_[0-9]{4}_[0-9]{2}$', base_name))
+            );
+
+            IF ARRAY_LENGTH(tables) IS NULL OR ARRAY_LENGTH(tables) = 0 THEN
+              CONTINUE;
+            END IF;
+
+            SET common_cols = (
+              SELECT ARRAY_AGG(column_name ORDER BY column_name)
+              FROM (
+                SELECT column_name
+                FROM \`${PROJECT_ID}.${DATASET}.INFORMATION_SCHEMA.COLUMNS\`
+                WHERE table_name IN UNNEST(tables)
+                GROUP BY column_name
+                HAVING COUNT(DISTINCT table_name) = ARRAY_LENGTH(tables)
+              )
+            );
+
+            IF ARRAY_LENGTH(common_cols) IS NULL OR ARRAY_LENGTH(common_cols) = 0 THEN
+              CONTINUE;
+            END IF;
+
+            SET col_list = (
+              SELECT STRING_AGG(CONCAT('`', c, '`') ORDER BY c)
+              FROM UNNEST(common_cols) AS c
+            );
+
+            SET union_sql = (
+              SELECT STRING_AGG(
+                FORMAT('SELECT %s FROM `%s.%s.%s`', col_list, project_id, dataset_id, t),
+                ' UNION ALL '
+              )
+              FROM UNNEST(tables) AS t
+            );
+
+            EXECUTE IMMEDIATE FORMAT(
+              'CREATE OR REPLACE VIEW `%s.%s.%s` AS %s',
+              project_id, dataset_id, base_name, union_sql
+            );
+
+          END FOR;
+          "
+
+      # Paso 5: Verificación REAL en BigQuery (conteo por tabla creada + view records si existe)
+      - name: Verificar conteos en BigQuery (tablas creadas + view records)
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          echo "Tablas creadas:"
+          cat tmp/created_tables.txt || true
+
+          python - <<'PY'
+          import os, subprocess
+
+          PROJECT_ID = os.environ["PROJECT_ID"]
+          DATASET    = os.environ["DATASET"]
+
+          def bq_query(sql: str) -> str:
+              cmd = ["bq", f"--project_id={PROJECT_ID}", "query", "--use_legacy_sql=false", "--format=csv", sql]
+              r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              if r.returncode != 0:
+                  return "ERR\n" + r.stdout
+              return r.stdout
+
+          def count_table(full: str) -> int:
+              sql = f"SELECT COUNT(1) AS c FROM `{full}`"
+              out = bq_query(sql)
+              lines = [x.strip() for x in out.splitlines() if x.strip()]
+              if len(lines) >= 2 and lines[0] == "c":
+                  return int(lines[1])
+              return -1
+
+          # Conteo por tabla creada
+          total = 0
+          try:
+              tables = [ln.strip() for ln in open("tmp/created_tables.txt", "r", encoding="utf-8") if ln.strip()]
+          except FileNotFoundError:
+              tables = []
+
+          print("\n--- Conteo por tabla mensual en BigQuery ---")
+          for t in tables:
+              c = count_table(t)
+              print(f"{t} -> {c}")
+              if c > 0:
+                  total += c
+
+          print(f"\nTOTAL filas (suma de tablas cargadas): {total}")
+
+          # Conteo view records si existe
+          view = f"{PROJECT_ID}.{DATASET}.records"
+          c_view = count_table(view)
+          if c_view >= 0:
+              print(f"\nVIEW {view} -> {c_view} filas")
+          else:
+              print(f"\nVIEW {view} no existe o no se pudo contar.")
+          PY
+
+      - name: Ver data/ (solo depurar)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ls -lah data || true
