@@ -1,4 +1,4 @@
-name: SEACE CSV ZIP -> BigQuery (3 meses + carga mensual + views + conteo REAL)
+name: SEACE CSV ZIP -> BigQuery (3 meses, NO descarta filas, views por columnas comunes)
 
 on:
   workflow_dispatch: {}
@@ -10,7 +10,6 @@ jobs:
     env:
       PROJECT_ID: heroic-ruler-481618-e5
       DATASET: github_actions
-      # 3 meses (AÑO-MES)
       MONTHS: "2025-11 2025-12 2026-01"
 
     steps:
@@ -27,7 +26,7 @@ jobs:
         with:
           project_id: heroic-ruler-481618-e5
 
-      # Paso 0: Dataset existe (no borra dataset)
+      # Paso 0: Crear dataset si no existe
       - name: Crear dataset si no existe
         shell: bash
         run: |
@@ -44,221 +43,279 @@ jobs:
           rm -rf tmp/*  || true
           echo "Runner limpio."
 
-      # Paso 2: Descargar ZIPs + extraer + contar filas CSV REALES (por archivo)
-      - name: Descargar ZIPs + extraer + contar filas CSV reales
+      # Paso 2: Descargar ZIPs + extraer + conteo REAL por CSV (rows)
+      - name: Descargar ZIPs + extraer + contar filas reales (por CSV)
         shell: bash
         run: |
           set -euxo pipefail
 
           python - <<'PY'
-          import os, zipfile, subprocess
+          import os, zipfile, subprocess, csv
           from pathlib import Path
+          from io import StringIO
           from collections import defaultdict
-          import csv
 
           MONTHS = os.environ["MONTHS"].split()
-
           tmp = Path("tmp")
           tmp.mkdir(exist_ok=True)
 
           def sh(cmd: str):
-              r = subprocess.run(["bash","-lc", cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-              if r.returncode != 0:
-                  print(r.stdout)
-                  raise SystemExit(r.returncode)
-              return r.stdout
+            r = subprocess.run(["bash","-lc", cmd], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            if r.returncode != 0:
+              print(r.stdout)
+              raise SystemExit(r.returncode)
+            return r.stdout
 
           def count_csv_rows(path: Path) -> int:
-              # Cuenta filas CSV reales (excluye header), soporta quoted newlines
-              b = path.read_bytes().replace(b"\x00", b"")
-              text = b.decode("utf-8", errors="replace")
-              from io import StringIO
-              f = StringIO(text, newline="")
-              reader = csv.reader(f)
-              header = next(reader, None)
-              if header is None:
-                  return 0
-              rows = 0
-              for _ in reader:
-                  rows += 1
-              return rows
+            b = path.read_bytes().replace(b"\x00", b"")
+            text = b.decode("utf-8", errors="replace")
+            f = StringIO(text, newline="")
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if header is None:
+              return 0
+            n = 0
+            for _ in reader:
+              n += 1
+            return n
 
-          summary_lines = []
-          total_all_months = 0
-          per_month_total = defaultdict(int)
+          out_lines = ["mes\tarchivo\trows\tsize_kb"]
+          per_month = defaultdict(int)
+          total = 0
 
           for ym in MONTHS:
-              year, month = ym.split("-")
-              url = f"https://contratacionesabiertas.oece.gob.pe/api/v1/file/seace_v3/csv/{year}/{month}"
-              zip_path = tmp / f"seace_{year}_{month}.zip"
-              out_dir  = tmp / f"unzipped_{year}_{month}"
+            y, m = ym.split("-")
+            url = f"https://contratacionesabiertas.oece.gob.pe/api/v1/file/seace_v3/csv/{y}/{m}"
+            zip_path = tmp / f"seace_{y}_{m}.zip"
+            out_dir  = tmp / f"unzipped_{y}_{m}"
 
-              print(f"\n=== MES {ym} ===")
-              print(f"URL: {url}")
+            print(f"\n=== MES {ym} ===")
+            sh(f"curl -L -f -sS '{url}' -o '{zip_path}'")
+            if zip_path.stat().st_size == 0:
+              raise SystemExit(f"ZIP vacío: {zip_path}")
 
-              sh(f"curl -L -f -sS '{url}' -o '{zip_path}'")
-              if zip_path.stat().st_size == 0:
-                  raise SystemExit(f"ZIP vacío: {zip_path}")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(zip_path, "r") as z:
+              z.extractall(out_dir)
 
-              out_dir.mkdir(parents=True, exist_ok=True)
-              with zipfile.ZipFile(zip_path, "r") as z:
-                  z.extractall(out_dir)
+            csv_files = sorted(out_dir.glob("*.csv"))
+            if not csv_files:
+              raise SystemExit(f"No hay CSVs en {zip_path}")
 
-              csv_files = sorted(out_dir.glob("*.csv"))
-              print(f"CSVs encontrados: {len(csv_files)}")
-              if not csv_files:
-                  raise SystemExit(f"No hay CSVs en {zip_path}")
+            month_sum = 0
+            print("--- Conteo REAL por CSV ---")
+            for f in csv_files:
+              rows = count_csv_rows(f)
+              size_kb = f.stat().st_size / 1024
+              month_sum += rows
+              print(f"{f.name:35s} rows={rows:9d} size_kb={size_kb:10.1f}")
+              out_lines.append(f"{ym}\t{f.name}\t{rows}\t{size_kb:.1f}")
 
-              print("\n--- Conteo REAL por CSV (rows, no líneas) ---")
-              month_sum = 0
-              for f in csv_files:
-                  rows = count_csv_rows(f)
-                  size_kb = f.stat().st_size / 1024
-                  month_sum += rows
-                  print(f"{f.name:35s} rows={rows:9d}  size_kb={size_kb:10.1f}")
-                  summary_lines.append(f"{ym}\t{f.name}\t{rows}\t{size_kb:.1f}")
+            per_month[ym] = month_sum
+            total += month_sum
+            print(f"TOTAL mes {ym}: {month_sum}")
 
-              per_month_total[ym] = month_sum
-              total_all_months += month_sum
-              print(f"\nTOTAL filas (suma de todos los CSV del mes {ym}): {month_sum}")
+          out_lines.append("")
+          out_lines.append("TOTAL_POR_MES")
+          for ym in MONTHS:
+            out_lines.append(f"{ym}\t{per_month[ym]}")
+          out_lines.append(f"GRAN_TOTAL_3MESES\t{total}")
 
           out = tmp / "conteo_csv_real.txt"
-          with out.open("w", encoding="utf-8") as w:
-              w.write("mes\tarchivo\trows\tsize_kb\n")
-              for ln in summary_lines:
-                  w.write(ln + "\n")
-              w.write("\nTOTAL_POR_MES\n")
-              for ym in MONTHS:
-                  w.write(f"{ym}\t{per_month_total[ym]}\n")
-              w.write(f"\nGRAN_TOTAL_3MESES\t{total_all_months}\n")
-
+          out.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
           print(f"\nResumen guardado en: {out}")
           PY
 
-      - name: Mostrar resumen de conteo CSV real
+      - name: Mostrar conteo real (primeras 250 líneas)
         shell: bash
         run: |
           set -euxo pipefail
-          echo "==== tmp/conteo_csv_real.txt (primeras 250 líneas) ===="
           sed -n '1,250p' tmp/conteo_csv_real.txt
 
-      # Paso 3: Normalizar headers + guardar CSV limpio en data/ + cargar a BQ por mes (REPLACE)
-      - name: Normalizar headers + guardar en data/ + cargar a BigQuery (tablas mensuales)
+      # Paso 3: Normalizar headers + guardar en data/ + cargar a BQ (SIN descartar filas) con heartbeat
+      - name: Normalizar headers + cargar a BigQuery (NO descarta filas, con heartbeat)
         shell: bash
         run: |
           set -euxo pipefail
 
           python - <<'PY'
-          import os, re, subprocess, sys
+          import os, re, subprocess, sys, time, json
           from pathlib import Path
 
           PROJECT_ID = os.environ["PROJECT_ID"]
           DATASET    = os.environ["DATASET"]
           MONTHS     = os.environ["MONTHS"].split()
 
-          tmp = Path("tmp")
+          tmp  = Path("tmp")
           data = Path("data")
           data.mkdir(exist_ok=True)
 
           def normalize_headers_line(header: str):
-              cols = header.rstrip("\n\r").split(",")
-              fixed = []
-              seen = {}
-              for c in cols:
-                  c = c.strip()
-                  c = c.replace("/", "_").replace(" ", "_").replace("-", "_")
-                  c = re.sub(r"[^A-Za-z0-9_]", "_", c)
-                  c = re.sub(r"_+", "_", c).strip("_")
-                  if not c:
-                      c = "col"
-                  if c[0].isdigit():
-                      c = "c_" + c
-                  base = c
-                  k = seen.get(base, 0)
-                  if k > 0:
-                      c = f"{base}_{k}"
-                  seen[base] = k + 1
-                  fixed.append(c)
-              return ",".join(fixed) + "\n"
+            cols = header.rstrip("\n\r").split(",")
+            fixed = []
+            seen = {}
+            for c in cols:
+              c = c.strip()
+              c = c.replace("/", "_").replace(" ", "_").replace("-", "_")
+              c = re.sub(r"[^A-Za-z0-9_]", "_", c)
+              c = re.sub(r"_+", "_", c).strip("_")
+              if not c:
+                c = "col"
+              if c[0].isdigit():
+                c = "c_" + c
+              base = c
+              k = seen.get(base, 0)
+              if k > 0:
+                c = f"{base}_{k}"
+              seen[base] = k + 1
+              fixed.append(c)
+            return ",".join(fixed) + "\n"
 
-          def run(cmd):
-              r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-              print(r.stdout)
-              return r.returncode
+          def run_capture(cmd):
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            return r.returncode, r.stdout
+
+          def bq_show_job(job_id: str) -> dict:
+            cmd = ["bq", f"--project_id={PROJECT_ID}", "show", "--format=prettyjson", job_id]
+            rc, out = run_capture(cmd)
+            if rc != 0:
+              return {"_error": out}
+            try:
+              return json.loads(out)
+            except Exception:
+              return {"_raw": out}
+
+          def wait_job(job_id: str, heartbeat_s: int = 20):
+            start = time.time()
+            last_state = None
+
+            while True:
+              info = bq_show_job(job_id)
+              if "_error" in info:
+                elapsed = int(time.time() - start)
+                print(f"[HB] job={job_id} elapsed={elapsed}s (no pude leer estado)")
+                time.sleep(heartbeat_s)
+                continue
+
+              state = info.get("status", {}).get("state", "UNKNOWN")
+              if state != last_state:
+                print(f"[JOB] {job_id} estado={state}")
+                last_state = state
+
+              elapsed = int(time.time() - start)
+
+              if state == "DONE":
+                err = info.get("status", {}).get("errorResult")
+                if err:
+                  print(f"[ERROR] Job {job_id} terminó con error: {err}")
+                  errs = info.get("status", {}).get("errors", [])
+                  if errs:
+                    print("[ERROR] Detalle errores (primeros 20):")
+                    for e in errs[:20]:
+                      print(e)
+                  return False
+
+                # outputRows (si aparece)
+                stats = info.get("statistics", {}).get("load", {})
+                out_rows = stats.get("outputRows")
+                if out_rows is not None:
+                  print(f"[OK] Job {job_id} DONE en {elapsed}s, outputRows={out_rows}")
+                else:
+                  print(f"[OK] Job {job_id} DONE en {elapsed}s")
+
+                return True
+
+              print(f"[HB] job={job_id} estado={state} elapsed={elapsed}s (BigQuery sigue...)")
+              time.sleep(heartbeat_s)
 
           created = []
 
           for ym in MONTHS:
-              year, month = ym.split("-")
-              suffix = f"{year}_{month}"
-              out_dir = tmp / f"unzipped_{year}_{month}"
+            y, m = ym.split("-")
+            suffix = f"{y}_{m}"
+            out_dir = tmp / f"unzipped_{y}_{m}"
 
-              csv_paths = sorted(out_dir.glob("*.csv"))
-              if not csv_paths:
-                  print(f"[WARN] No hay CSVs para {ym} en {out_dir}")
-                  continue
+            csv_paths = sorted(out_dir.glob("*.csv"))
+            if not csv_paths:
+              print(f"[WARN] No hay CSVs para {ym} en {out_dir}")
+              continue
 
-              for src in csv_paths:
-                  base = src.name
-                  name_no_ext = src.stem
+            for src in csv_paths:
+              name_no_ext = src.stem
 
-                  table_base = re.sub(r"[^A-Za-z0-9_]", "_", name_no_ext)
-                  table_base = re.sub(r"_+", "_", table_base).strip("_") or "tabla"
-                  if table_base[0].isdigit():
-                      table_base = "t_" + table_base
+              table_base = re.sub(r"[^A-Za-z0-9_]", "_", name_no_ext)
+              table_base = re.sub(r"_+", "_", table_base).strip("_") or "tabla"
+              if table_base[0].isdigit():
+                table_base = "t_" + table_base
 
-                  table = f"{table_base}_{suffix}"   # records_2026_01
-                  out_clean = data / f"{table}.csv"
+              table = f"{table_base}_{suffix}"      # records_2026_01
+              out_clean = data / f"{table}.csv"
 
-                  b = src.read_bytes().replace(b"\x00", b"")
-                  lines = b.decode("utf-8", errors="replace").splitlines(True)
-                  if not lines:
-                      print(f"[SKIP] {base}: vacío")
-                      continue
+              b = src.read_bytes().replace(b"\x00", b"")
+              lines = b.decode("utf-8", errors="replace").splitlines(True)
+              if not lines:
+                print(f"[SKIP] {src.name}: vacío")
+                continue
 
-                  lines[0] = normalize_headers_line(lines[0])
+              lines[0] = normalize_headers_line(lines[0])
 
-                  with open(out_clean, "w", encoding="utf-8", newline="") as g:
-                      g.writelines(lines)
+              with open(out_clean, "w", encoding="utf-8", newline="") as g:
+                g.writelines(lines)
 
-                  full_table = f"{DATASET}.{table}"
+              full_table = f"{DATASET}.{table}"
+              size_mb = out_clean.stat().st_size / (1024*1024)
+              print("\n====================================================")
+              print(f"LOAD {ym} {src.name} -> {PROJECT_ID}:{full_table}")
+              print(f"CSV limpio: {out_clean} size={size_mb:.2f} MB")
+              print("Regla: NO se descartan filas. Si hay error, falla.")
+              print("====================================================")
 
-                  cmd = [
-                      "bq", f"--project_id={PROJECT_ID}", "load",
-                      "--source_format=CSV",
-                      "--autodetect",
-                      "--skip_leading_rows=1",
-                      "--allow_quoted_newlines",
-                      "--allow_jagged_rows",
-                      "--max_bad_records=5000",
-                      "--replace",
-                      full_table,
-                      str(out_clean)
-                  ]
+              job_id = re.sub(r"[^A-Za-z0-9_]", "_", f"load_{table}_{int(time.time())}")
 
-                  print(f"\n=== LOAD {ym} {base} -> {PROJECT_ID}:{full_table} ===")
-                  rc = run(cmd)
-                  if rc != 0:
-                      print(f"[ERROR] Falló carga: {full_table}")
-                      sys.exit(rc)
+              # CLAVE: NO descartar filas
+              # - max_bad_records=0
+              # - sin allow_jagged_rows
+              cmd = [
+                "bq", f"--project_id={PROJECT_ID}", "load",
+                "--job_id", job_id,
+                "--nosync",
+                "--source_format=CSV",
+                "--autodetect",
+                "--skip_leading_rows=1",
+                "--allow_quoted_newlines",
+                "--max_bad_records=0",
+                "--replace",
+                full_table,
+                str(out_clean)
+              ]
 
-                  created.append(f"{PROJECT_ID}.{full_table}")
+              rc, out = run_capture(cmd)
+              print(out)
+              if rc != 0:
+                print(f"[ERROR] No pude iniciar el job {job_id} para {full_table}")
+                sys.exit(rc)
+
+              ok = wait_job(job_id, heartbeat_s=20)
+              if not ok:
+                print(f"[ERROR] Falló job {job_id} cargando {full_table}")
+                sys.exit(1)
+
+              created.append(f"{PROJECT_ID}.{full_table}")
 
           (tmp / "created_tables.txt").write_text("\n".join(created) + "\n", encoding="utf-8")
-          print("\nOK: Tablas mensuales cargadas.")
+          print("\nOK: Tablas mensuales cargadas SIN descartar filas.")
           PY
 
-      # Paso 4: Crear views base uniendo tablas mensuales (columnas comunes)
-      - name: Crear/Actualizar views base (UNION ALL por familia, columnas comunes)
+      # Paso 4: Crear views base (solo tablas existentes, solo columnas comunes)
+      - name: Crear/Actualizar views base (tablas existentes + columnas comunes)
         shell: bash
         run: |
           set -euxo pipefail
 
-          bq --project_id="$PROJECT_ID" query --use_legacy_sql=false "
-          DECLARE project_id STRING DEFAULT '${PROJECT_ID}';
-          DECLARE dataset_id STRING DEFAULT '${DATASET}';
+          bq --project_id="$PROJECT_ID" query --use_legacy_sql=false <<'SQL'
+          DECLARE project_id STRING DEFAULT 'heroic-ruler-481618-e5';
+          DECLARE dataset_id STRING DEFAULT 'github_actions';
 
-          -- DECLARE solo al inicio (BigQuery se pone sensible)
           DECLARE base_name STRING;
           DECLARE tables ARRAY<STRING>;
           DECLARE common_cols ARRAY<STRING>;
@@ -267,16 +324,17 @@ jobs:
 
           FOR fam IN (
             SELECT DISTINCT REGEXP_REPLACE(table_name, r'_[0-9]{4}_[0-9]{2}$', '') AS base
-            FROM \`${PROJECT_ID}.${DATASET}.INFORMATION_SCHEMA.TABLES\`
+            FROM `heroic-ruler-481618-e5.github_actions.INFORMATION_SCHEMA.TABLES`
             WHERE table_type = 'BASE TABLE'
               AND REGEXP_CONTAINS(table_name, r'_[0-9]{4}_[0-9]{2}$')
           ) DO
 
             SET base_name = fam.base;
 
+            -- SOLO tablas existentes de esa familia
             SET tables = (
               SELECT ARRAY_AGG(table_name ORDER BY table_name)
-              FROM \`${PROJECT_ID}.${DATASET}.INFORMATION_SCHEMA.TABLES\`
+              FROM `heroic-ruler-481618-e5.github_actions.INFORMATION_SCHEMA.TABLES`
               WHERE table_type = 'BASE TABLE'
                 AND REGEXP_CONTAINS(table_name, FORMAT(r'^%s_[0-9]{4}_[0-9]{2}$', base_name))
             );
@@ -285,11 +343,12 @@ jobs:
               CONTINUE;
             END IF;
 
+            -- SOLO columnas comunes (si hay columnas extra, se ignoran)
             SET common_cols = (
               SELECT ARRAY_AGG(column_name ORDER BY column_name)
               FROM (
                 SELECT column_name
-                FROM \`${PROJECT_ID}.${DATASET}.INFORMATION_SCHEMA.COLUMNS\`
+                FROM `heroic-ruler-481618-e5.github_actions.INFORMATION_SCHEMA.COLUMNS`
                 WHERE table_name IN UNNEST(tables)
                 GROUP BY column_name
                 HAVING COUNT(DISTINCT table_name) = ARRAY_LENGTH(tables)
@@ -319,10 +378,10 @@ jobs:
             );
 
           END FOR;
-          "
+          SQL
 
-      # Paso 5: Verificación REAL en BigQuery (conteo por tabla creada + view records si existe)
-      - name: Verificar conteos en BigQuery (tablas creadas + view records)
+      # Paso 5: Verificación en BigQuery (conteo por tabla mensual + view records)
+      - name: Verificar conteos en BigQuery (tablas mensuales + view records)
         shell: bash
         run: |
           set -euxo pipefail
@@ -334,44 +393,43 @@ jobs:
           import os, subprocess
 
           PROJECT_ID = os.environ["PROJECT_ID"]
-          DATASET    = os.environ["DATASET"]
 
           def bq_query(sql: str) -> str:
-              cmd = ["bq", f"--project_id={PROJECT_ID}", "query", "--use_legacy_sql=false", "--format=csv", sql]
-              r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-              if r.returncode != 0:
-                  return "ERR\n" + r.stdout
-              return r.stdout
+            cmd = ["bq", f"--project_id={PROJECT_ID}", "query", "--use_legacy_sql=false", "--format=csv", sql]
+            r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            if r.returncode != 0:
+              return "ERR\n" + r.stdout
+            return r.stdout
 
           def count_table(full: str) -> int:
-              sql = f"SELECT COUNT(1) AS c FROM `{full}`"
-              out = bq_query(sql)
-              lines = [x.strip() for x in out.splitlines() if x.strip()]
-              if len(lines) >= 2 and lines[0] == "c":
-                  return int(lines[1])
-              return -1
+            sql = f"SELECT COUNT(1) AS c FROM `{full}`"
+            out = bq_query(sql)
+            lines = [x.strip() for x in out.splitlines() if x.strip()]
+            if len(lines) >= 2 and lines[0] == "c":
+              return int(lines[1])
+            return -1
 
           total = 0
           try:
-              tables = [ln.strip() for ln in open("tmp/created_tables.txt", "r", encoding="utf-8") if ln.strip()]
+            tables = [ln.strip() for ln in open("tmp/created_tables.txt", "r", encoding="utf-8") if ln.strip()]
           except FileNotFoundError:
-              tables = []
+            tables = []
 
-          print("\n--- Conteo por tabla mensual en BigQuery ---")
+          print("\n--- Conteo por tabla mensual ---")
           for t in tables:
-              c = count_table(t)
-              print(f"{t} -> {c}")
-              if c > 0:
-                  total += c
+            c = count_table(t)
+            print(f"{t} -> {c}")
+            if c > 0:
+              total += c
 
-          print(f"\nTOTAL filas (suma de tablas cargadas): {total}")
+          print(f"\nTOTAL filas (suma de tablas mensuales cargadas): {total}")
 
-          view = f"{PROJECT_ID}.{DATASET}.records"
+          view = f"{PROJECT_ID}.github_actions.records"
           c_view = count_table(view)
           if c_view >= 0:
-              print(f"\nVIEW {view} -> {c_view} filas")
+            print(f"\nVIEW {view} -> {c_view} filas")
           else:
-              print(f"\nVIEW {view} no existe o no se pudo contar.")
+            print(f"\nVIEW {view} no existe o no se pudo contar.")
           PY
 
       - name: Ver data/ (solo depurar)
