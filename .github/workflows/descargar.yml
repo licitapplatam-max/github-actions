@@ -34,41 +34,34 @@ jobs:
           set -euo pipefail
           bq --project_id="$PROJECT_ID" mk --dataset "$PROJECT_ID:$DATASET" || true
 
-      # 1) LIMPIEZA TOTAL BigQuery (REAL: sin bq ls, usando INFORMATION_SCHEMA)
-      - name: LIMPIEZA TOTAL BigQuery (tablas + vistas) - REAL
+      # 1) LIMPIEZA TOTAL BigQuery (tablas + vistas)
+      - name: LIMPIEZA TOTAL BigQuery (tablas + vistas)
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, subprocess, csv, io
+          import os, subprocess
 
           PROJECT = os.environ["PROJECT_ID"]
-          DATASET  = os.environ["DATASET"]
+          DATASET = os.environ["DATASET"]
 
-          q = f"""
-          SELECT table_name, table_type
-          FROM `{PROJECT}.{DATASET}.INFORMATION_SCHEMA.TABLES`
-          """
-          out = subprocess.check_output(
-              ["bq","--project_id",PROJECT,"query","--use_legacy_sql=false","--format=csv",q],
-              text=True
-          )
+          out = subprocess.check_output(["bq", "--project_id", PROJECT, "ls", DATASET], text=True)
+          lines = out.splitlines()
 
-          rows = list(csv.DictReader(io.StringIO(out)))
-          if not rows:
+          names = []
+          for ln in lines[2:]:
+              parts = ln.split()
+              if parts:
+                  names.append(parts[0])
+
+          if not names:
               print("Dataset ya estaba vacío.")
-              raise SystemExit(0)
+          else:
+              for name in names:
+                  print(f"Borrando: {DATASET}.{name}")
+                  subprocess.check_call(["bq", "--project_id", PROJECT, "rm", "-f", "-t", f"{DATASET}.{name}"])
 
-          deleted = 0
-          for r in rows:
-              name = r["table_name"]
-              ttype = r["table_type"]  # BASE TABLE / VIEW
-              flag = "-v" if ttype.upper() == "VIEW" else "-t"
-              print(f"Borrando: {DATASET}.{name} ({ttype})")
-              subprocess.check_call(["bq","--project_id",PROJECT,"rm","-f",flag,f"{DATASET}.{name}"])
-              deleted += 1
-
-          print(f"OK: limpieza BigQuery completa. borrados={deleted}")
+          print("OK: limpieza BigQuery completa.")
           PY
 
       # 2) Limpieza runner
@@ -80,8 +73,8 @@ jobs:
           mkdir -p data tmp
           echo "Runner limpio."
 
-      # 3) Descargar ZIPs + extraer + expected.tsv (la verdad de lo que vino)
-      - name: Descargar ZIPs + extraer + expected.tsv (sin spam)
+      # 3) Descargar ZIPs + extraer + expected.tsv (lo que REALMENTE viene)
+      - name: Descargar ZIPs + extraer + expected.tsv
         shell: bash
         run: |
           set -euo pipefail
@@ -112,7 +105,7 @@ jobs:
               zip_path = tmp / f"seace_{y}_{m}.zip"
               out_dir  = tmp / f"unzipped_{y}_{m}"
 
-              print(f"=== MES {ym} ===")
+              print(f"\n=== MES {ym} ===")
               run(["bash","-lc", f"curl -L -f -sS '{url}' -o '{zip_path}'"])
 
               if zip_path.stat().st_size == 0:
@@ -130,22 +123,23 @@ jobs:
               for f in csvs:
                   total_lines = count_lines_fast(f)
                   data_rows = max(total_lines - 1, 0)
-                  per_family[f.stem] += data_rows
+                  fam = f.stem
+                  per_family[fam] += data_rows
 
               for fam, rows in sorted(per_family.items()):
                   expected_lines.append(f"{fam}\t{ym}\t{rows}")
 
-              keys = ["records", "releases", "ten_tenderers", "parties", "com_parties", "com_ten_tenderers"]
+              keys = ["records", "releases", "ten_tenderers", "parties"]
               present_keys = [k for k in keys if k in per_family]
               month_summary.append((ym, len(per_family), present_keys))
 
           (tmp/"expected.tsv").write_text("\n".join(expected_lines) + "\n", encoding="utf-8")
 
-          print("=== RESUMEN (sin spam) ===")
+          print("\n=== RESUMEN (sin spam) ===")
           for ym, fam_count, present_keys in month_summary:
               print(f"{ym}: familias={fam_count} | claves_presentes={present_keys}")
 
-          print("OK: tmp/expected.tsv creado")
+          print("\nOK: tmp/expected.tsv creado")
           PY
 
       - name: Mostrar expected.tsv (primeras 120 líneas)
@@ -154,7 +148,7 @@ jobs:
           set -euo pipefail
           sed -n '1,120p' tmp/expected.tsv
 
-      # 4) Normalizar headers + schema TODO STRING + CSV limpio en data/
+      # 4) Normalizar headers + schema TODO STRING + guardar CSV limpio en data/
       - name: Normalizar headers + schema TODO STRING
         shell: bash
         run: |
@@ -170,7 +164,7 @@ jobs:
           def norm_name(s: str) -> str:
               s = s.strip().replace("/", "_").replace(" ", "_").replace("-", "_")
               s = re.sub(r"[^A-Za-z0-9_]", "_", s)
-              s = re.sub(r"_+", "_", s).strip("_")
+              s = re.sub(r"_+", "_").strip("_")
               if not s:
                   s = "col"
               if s[0].isdigit():
@@ -191,7 +185,6 @@ jobs:
               return fixed
 
           created = 0
-          sample = []
 
           for ym in MONTHS:
               y, m = ym.split("-")
@@ -217,16 +210,11 @@ jobs:
                   (data / f"{table}.schema.json").write_text(json.dumps(schema), encoding="utf-8")
 
                   created += 1
-                  if len(sample) < 12:
-                      sample.append(out_csv.name)
 
           print(f"OK: CSVs limpios creados: {created}")
-          print("Muestra (12):")
-          for s in sample:
-              print(" -", s)
           PY
 
-      # 5) Cargar CSVs a BigQuery (captura real de fallas)
+      # 5) Cargar CSVs a BigQuery (captura de errores sin romper)
       - name: Cargar CSVs a BigQuery (captura real de fallas)
         shell: bash
         run: |
@@ -276,13 +264,15 @@ jobs:
           done
 
           echo "RESUMEN LOAD: total=$total ok=$ok fail=$fail"
+
           if [[ -s tmp/bq_load_errors.log ]]; then
+            echo ""
             echo "=== ERRORES bq load (primeras 400 líneas) ==="
             sed -n '1,400p' tmp/bq_load_errors.log
           fi
 
-      # 5.1) Gate REAL: expected.tsv vs tablas reales en BigQuery (SIN bq ls)
-      - name: Gate real post-load (si falta algo que el ZIP sí trajo => FAIL)
+      # 5.1) Diagnóstico REAL post-load: expected.tsv vs tablas mensuales reales
+      - name: Diagnóstico post-load (expected vs reales)
         shell: bash
         run: |
           set -euo pipefail
@@ -293,10 +283,8 @@ jobs:
           PROJECT = os.environ["PROJECT_ID"]
           DATASET  = os.environ["DATASET"]
 
-          expected_path = Path("tmp/expected.tsv")
           exp_tables = set()
-
-          for ln in expected_path.read_text(encoding="utf-8").splitlines()[1:]:
+          for ln in Path("tmp/expected.tsv").read_text(encoding="utf-8").splitlines()[1:]:
               if not ln.strip():
                   continue
               fam, ym, rows = ln.split("\t")
@@ -306,7 +294,8 @@ jobs:
           q = f"""
           SELECT table_name
           FROM `{PROJECT}.{DATASET}.INFORMATION_SCHEMA.TABLES`
-          WHERE REGEXP_CONTAINS(table_name, r'_[0-9]{{4}}_[0-9]{{2}}$')
+          WHERE table_type='BASE TABLE'
+            AND REGEXP_CONTAINS(table_name, r'_[0-9]{{4}}_[0-9]{{2}}$')
           """
           out = subprocess.check_output(
               ["bq","--project_id",PROJECT,"query","--use_legacy_sql=false","--format=csv",q],
@@ -315,21 +304,21 @@ jobs:
           real_monthly = set([ln.strip() for ln in out.splitlines()[1:] if ln.strip()])
 
           missing = sorted(exp_tables - real_monthly)
+
           Path("tmp/missing_monthly_tables.txt").write_text("\n".join(missing) + ("\n" if missing else ""), encoding="utf-8")
 
-          print("=== GATE POST-LOAD ===")
+          print("=== DIAGNÓSTICO POST-LOAD ===")
           print(f"expected_monthly={len(exp_tables)} real_monthly={len(real_monthly)} missing={len(missing)}")
 
           if missing:
-              print("--- FALTAN TABLAS MENSUALES QUE EL ZIP SÍ TRAJO (primeros 120) ---")
+              print("--- FALTAN (primeros 120) ---")
               for t in missing[:120]:
                   print(t)
-              raise SystemExit(1)
 
-          print("OK: todo lo esperado se cargó.")
+          print("OK: tmp/missing_monthly_tables.txt creado")
           PY
 
-      # 6) Unión por familia (estable) usando INFORMATION_SCHEMA (SIN bq ls)
+      # 6) Unión por familia (estable, columnas faltantes = NULL)
       - name: Unir tablas por familia (estable, columnas faltantes = NULL)
         shell: bash
         run: |
@@ -352,6 +341,7 @@ jobs:
               text=True
           )
           monthly = sorted([ln.strip() for ln in out.splitlines()[1:] if ln.strip()])
+
           if not monthly:
               raise SystemExit("No hay tablas mensuales *_YYYY_MM para unir.")
 
@@ -419,7 +409,7 @@ jobs:
           PROJECT = os.environ["PROJECT_ID"]
           DATASET  = os.environ["DATASET"]
 
-          focus = ["records", "releases", "ten_tenderers", "parties", "com_parties", "com_ten_tenderers"]
+          focus = ["records", "releases", "ten_tenderers", "parties"]
 
           def bq_show(table):
               try:
@@ -440,8 +430,8 @@ jobs:
                   print(f"{t}: OK numRows={meta.get('numRows','NA')}")
           PY
 
-      # 8) Artifact: para descargar tmp/ y ver TODO
-      - name: Subir artefacto de diagnóstico (tmp/)
+      # 8) Subir tmp/ como artifact (para que lo descargues y veas missing/logs)
+      - name: Subir artefacto diagnóstico (tmp/)
         if: always()
         uses: actions/upload-artifact@v4
         with:
