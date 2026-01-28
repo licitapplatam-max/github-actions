@@ -34,7 +34,7 @@ jobs:
           set -euo pipefail
           bq --project_id="$PROJECT_ID" mk --dataset "$PROJECT_ID:$DATASET" || true
 
-      # 1) LIMPIEZA TOTAL BigQuery (REAL, sin SQL raro)
+      # 1) LIMPIEZA TOTAL BigQuery
       - name: LIMPIEZA TOTAL BigQuery (tablas + vistas)
         shell: bash
         run: |
@@ -46,198 +46,161 @@ jobs:
           DATASET = os.environ["DATASET"]
 
           out = subprocess.check_output(
-              ["bq", "--project_id", PROJECT, "ls", DATASET],
+              ["bq","--project_id",PROJECT,"ls",DATASET],
               text=True
-          )
+          ).splitlines()
 
-          lines = out.splitlines()
-          names = []
-          for ln in lines[2:]:
-              parts = ln.split()
-              if parts:
-                  names.append(parts[0])
+          names = [ln.split()[0] for ln in out[2:] if ln.strip()]
 
-          if not names:
-              print("Dataset ya estaba vacío.")
-          else:
-              for name in names:
-                  print(f"Borrando {DATASET}.{name}")
-                  subprocess.check_call([
-                      "bq","--project_id",PROJECT,"rm","-f","-t",
-                      f"{DATASET}.{name}"
-                  ])
+          for n in names:
+              subprocess.call(
+                  ["bq","--project_id",PROJECT,"rm","-f","-t",f"{DATASET}.{n}"]
+              )
 
-          print("OK: limpieza BigQuery completa.")
+          print("OK: dataset limpio")
           PY
 
       # 2) Limpieza runner
-      - name: Limpiar runner (data/ tmp/)
+      - name: Limpiar runner
         shell: bash
         run: |
-          set -euo pipefail
           rm -rf data tmp || true
           mkdir -p data tmp
-          echo "Runner limpio."
 
-      # 3) Descargar ZIPs + extraer + conteo REAL
-      - name: Descargar ZIPs + extraer + conteo REAL
+      # 3) Descargar ZIPs + conteo REAL
+      - name: Descargar ZIPs + conteo REAL
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, zipfile, subprocess
+          import zipfile, subprocess
           from pathlib import Path
           from collections import defaultdict
+          import os
 
           MONTHS = os.environ["MONTHS"].split()
-          tmp = Path("tmp"); tmp.mkdir(exist_ok=True)
+          tmp = Path("tmp")
 
-          def run(cmd):
-              r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-              if r.returncode != 0:
-                  print(r.stdout)
-                  raise SystemExit(r.returncode)
-
-          def count_lines(path):
-              with path.open("rb") as f:
-                  return sum(1 for _ in f)
+          def count(p):
+              with p.open("rb") as f:
+                  return max(sum(1 for _ in f) - 1, 0)
 
           for ym in MONTHS:
-              y, m = ym.split("-")
+              y,m = ym.split("-")
               url = f"https://contratacionesabiertas.oece.gob.pe/api/v1/file/seace_v3/csv/{y}/{m}"
-              zip_path = tmp / f"seace_{y}_{m}.zip"
-              out_dir = tmp / f"unzipped_{y}_{m}"
+              z = tmp / f"{ym}.zip"
+              d = tmp / ym
+              subprocess.check_call(["curl","-L","-f","-sS",url,"-o",z])
+              d.mkdir(exist_ok=True)
+              with zipfile.ZipFile(z) as zz:
+                  zz.extractall(d)
 
-              print(f"\n=== MES {ym} ===")
-              run(["bash","-lc", f"curl -L -f -sS '{url}' -o '{zip_path}'"])
-
-              out_dir.mkdir(parents=True, exist_ok=True)
-              with zipfile.ZipFile(zip_path, "r") as z:
-                  z.extractall(out_dir)
-
-              csvs = sorted(out_dir.glob("*.csv"))
-              print(f"CSVs encontrados: {len(csvs)}")
-
-              fams = defaultdict(int)
-              for f in csvs:
-                  rows = max(count_lines(f) - 1, 0)
-                  fams[f.stem] += rows
-                  print(f"{f.name:35s} rows={rows}")
-
-              print("--- Total por familia ---")
-              for k,v in sorted(fams.items()):
-                  print(f"{k:35s} {v}")
+              print(f"\nMES {ym}")
+              for f in sorted(d.glob("*.csv")):
+                  print(f"{f.name:35s} rows={count(f)}")
           PY
 
-      # 4) Normalizar headers + schema TODO STRING
-      - name: Normalizar headers + schema TODO STRING
+      # 4) Normalizar CSV + schema STRING
+      - name: Normalizar CSV
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, re, json
+          import re, json, os
           from pathlib import Path
 
           MONTHS = os.environ["MONTHS"].split()
           tmp = Path("tmp")
-          data = Path("data"); data.mkdir(exist_ok=True)
+          data = Path("data")
 
           def norm(s):
-              s = s.strip().replace("/", "_").replace(" ", "_").replace("-", "_")
-              s = re.sub(r"[^A-Za-z0-9_]", "_", s)
-              s = re.sub(r"_+", "_", s).strip("_")
-              if not s: s = "col"
-              if s[0].isdigit(): s = "c_" + s
-              return s
+              s = re.sub(r'[^A-Za-z0-9_]', '_', s.replace('/','_'))
+              s = re.sub(r'_+', '_', s).strip('_')
+              if s[0].isdigit(): s = 'c_' + s
+              return s or 'col'
 
           for ym in MONTHS:
-              y, m = ym.split("-")
-              src_dir = tmp / f"unzipped_{y}_{m}"
-              for src in src_dir.glob("*.csv"):
-                  table = f"{norm(src.stem)}_{y}_{m}"
-                  raw = src.read_bytes().replace(b"\x00", b"")
-                  lines = raw.decode("utf-8", errors="replace").splitlines(True)
+              y,m = ym.split("-")
+              for src in (tmp/ym).glob("*.csv"):
+                  name = f"{norm(src.stem)}_{y}_{m}"
+                  b = src.read_bytes().replace(b'\x00',b'')
+                  lines = b.decode("utf-8","replace").splitlines(True)
                   if not lines: continue
-
-                  header = []
+                  cols = []
                   seen = {}
-                  for c in lines[0].strip().split(","):
+                  for c in lines[0].split(","):
                       c = norm(c)
-                      n = seen.get(c,0)
-                      seen[c]=n+1
-                      if n: c=f"{c}_{n}"
-                      header.append(c)
-                  lines[0] = ",".join(header)+"\n"
-
-                  (data/f"{table}.csv").write_text("".join(lines),encoding="utf-8")
-                  schema=[{"name":c,"type":"STRING","mode":"NULLABLE"} for c in header]
-                  (data/f"{table}.schema.json").write_text(json.dumps(schema))
-          print("OK: CSVs normalizados.")
+                      seen[c] = seen.get(c,0)+1
+                      cols.append(c if seen[c]==1 else f"{c}_{seen[c]-1}")
+                  lines[0] = ",".join(cols)+"\n"
+                  (data/f"{name}.csv").write_text("".join(lines))
+                  (data/f"{name}.schema.json").write_text(
+                      json.dumps([{"name":c,"type":"STRING"} for c in cols])
+                  )
           PY
 
-      # 5) Cargar CSVs a BigQuery
-      - name: Cargar CSVs a BigQuery
+      # 5) Cargar CSVs
+      - name: Cargar CSVs
         shell: bash
         run: |
           set -euo pipefail
-          for csv in data/*.csv; do
-            t=$(basename "$csv" .csv)
+          for f in data/*.csv; do
+            t=$(basename "$f" .csv)
             bq --project_id="$PROJECT_ID" load \
               --replace \
               --source_format=CSV \
               --skip_leading_rows=1 \
-              --allow_quoted_newlines \
-              --max_bad_records=0 \
-              "$DATASET.$t" \
-              "$csv" \
-              "data/$t.schema.json"
+              "$DATASET.$t" "$f" "data/$t.schema.json"
           done
 
-      # 6) UNION FINAL BLINDADA (MESES FALTANTES OK)
-      - name: Unir tablas por familia (estable)
+      # 6) UNION ESTABLE (fuente = data/)
+      - name: UNION estable por familia
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, re, subprocess
+          import os,re,subprocess
+          from pathlib import Path
           from collections import defaultdict
 
           PROJECT=os.environ["PROJECT_ID"]
           DATASET=os.environ["DATASET"]
 
-          out=subprocess.check_output(["bq","--project_id",PROJECT,"ls",DATASET],text=True)
-          tables=[l.split()[0] for l in out.splitlines()[2:] if l.strip()]
-          monthly=[t for t in tables if re.search(r'_\d{4}_\d{2}$',t)]
-
           fams=defaultdict(list)
-          for t in monthly:
-              fam=re.sub(r'_\d{4}_\d{2}$','',t)
-              fams[fam].append(t)
+          for f in Path("data").glob("*.csv"):
+              t=f.stem
+              if re.search(r'_\d{4}_\d{2}$',t):
+                  fam=re.sub(r'_\d{4}_\d{2}$','',t)
+                  fams[fam].append(t)
 
           def cols(t):
-              q=f"SELECT column_name FROM `{PROJECT}.{DATASET}.INFORMATION_SCHEMA.COLUMNS` WHERE table_name='{t}' ORDER BY ordinal_position"
-              o=subprocess.check_output(["bq","--project_id",PROJECT,"query","--use_legacy_sql=false","--format=csv",q],text=True)
-              return [l.strip() for l in o.splitlines()[1:] if l.strip()]
+              q=f"""SELECT column_name FROM `{PROJECT}.{DATASET}.INFORMATION_SCHEMA.COLUMNS`
+                    WHERE table_name='{t}' ORDER BY ordinal_position"""
+              o=subprocess.check_output(
+                  ["bq","--project_id",PROJECT,"query","--use_legacy_sql=false","--format=csv",q],
+                  text=True)
+              return [l for l in o.splitlines()[1:] if l]
 
           for fam,ts in fams.items():
               ts=sorted(ts)
               allc=[]
               seen=set()
-              cmap={}
+              per={}
               for t in ts:
-                  c=cols(t); cmap[t]=set(c)
+                  c=cols(t)
+                  per[t]=set(c)
                   for x in c:
                       if x not in seen:
                           seen.add(x); allc.append(x)
-
               sels=[]
               for t in ts:
-                  expr=[]
-                  for c in allc:
-                      expr.append(f"`{c}` AS `{c}`" if c in cmap[t] else f"CAST(NULL AS STRING) AS `{c}`")
-                  sels.append(f"SELECT {', '.join(expr)} FROM `{PROJECT}.{DATASET}.{t}`")
-
+                  sels.append("SELECT "+", ".join(
+                      f"`{c}`" if c in per[t] else f"CAST(NULL AS STRING) AS `{c}`"
+                      for c in allc
+                  )+f" FROM `{PROJECT}.{DATASET}.{t}`")
               sql=f"CREATE OR REPLACE TABLE `{PROJECT}.{DATASET}.{fam}` AS "+ " UNION ALL ".join(sels)
-              subprocess.check_call(["bq","--project_id",PROJECT,"query","--use_legacy_sql=false",sql])
-              print(f"[OK] {fam}")
+              subprocess.check_call(
+                  ["bq","--project_id",PROJECT,"query","--use_legacy_sql=false",sql]
+              )
+              print(f"OK UNION {fam}")
           PY
