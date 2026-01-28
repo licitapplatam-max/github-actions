@@ -1,4 +1,4 @@
-name: SEACE CSV ZIP -> BigQuery (3 meses FULL CLEAN + carga + union estable + diagnostico real sin spam)
+name: SEACE CSV ZIP to BigQuery 3 months clean load union diag
 
 on:
   workflow_dispatch: {}
@@ -27,20 +27,29 @@ jobs:
         with:
           project_id: heroic-ruler-481618-e5
 
-      # 0) Crear dataset si no existe
-      - name: Crear dataset si no existe
+      - name: Init folders and cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf data tmp || true
+          mkdir -p data tmp
+          : > tmp/errors.txt
+          echo "OK init"
+
+      - name: Create dataset if missing
         shell: bash
         run: |
           set -euo pipefail
           bq --project_id="$PROJECT_ID" mk --dataset "$PROJECT_ID:$DATASET" || true
+          echo "OK dataset"
 
-      # 1) LIMPIEZA TOTAL BigQuery (sin spam)
-      - name: LIMPIEZA TOTAL BigQuery (tablas + vistas)
+      - name: BigQuery wipe all tables and views
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
           import os, subprocess
+
           PROJECT = os.environ["PROJECT_ID"]
           DATASET  = os.environ["DATASET"]
 
@@ -54,21 +63,10 @@ jobs:
           for name in names:
               subprocess.check_call(["bq", "--project_id", PROJECT, "rm", "-f", "-t", f"{DATASET}.{name}"])
 
-          print(f"OK: limpieza BigQuery completa. Borradas: {len(names)}")
+          print(f"OK wipe: removed {len(names)} objects")
           PY
 
-      # 2) Limpieza runner + init cache
-      - name: Limpiar runner (data/ tmp/) + init cache
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf data tmp || true
-          mkdir -p data tmp
-          : > tmp/errors.txt
-          echo "Runner limpio."
-
-      # 3) Descargar ZIPs + extraer + expected.tsv (SIN SPAM por archivo)
-      - name: Descargar ZIPs + extraer + expected.tsv
+      - name: Download ZIPs extract build expected.tsv
         shell: bash
         run: |
           set -euo pipefail
@@ -78,8 +76,8 @@ jobs:
           from collections import defaultdict
 
           MONTHS = os.environ["MONTHS"].split()
-          tmp = Path("tmp"); tmp.mkdir(exist_ok=True)
-          err = tmp/"errors.txt"
+          tmp = Path("tmp")
+          err = tmp / "errors.txt"
 
           def log(code, msg):
               err.open("a", encoding="utf-8").write(f"{code}\t{msg}\n")
@@ -92,7 +90,7 @@ jobs:
               with path.open("rb") as f:
                   return sum(1 for _ in f)
 
-          expected_lines = ["family\tym\texpected_rows"]
+          expected = ["family\tym\texpected_rows"]
 
           for ym in MONTHS:
               y, m = ym.split("-")
@@ -102,7 +100,7 @@ jobs:
 
               rc, out = run(["bash","-lc", f"curl -L -f -sS '{url}' -o '{zip_path}'"])
               if rc != 0:
-                  log("DOWNLOAD_FAIL", f"{ym}\t{url}")
+                  log("DOWNLOAD_FAIL", f"{ym}\t{url}\t{out.strip()[:300]}")
                   continue
 
               if zip_path.stat().st_size == 0:
@@ -120,21 +118,20 @@ jobs:
 
               per_family = defaultdict(int)
               for f in csvs:
-                  total_lines = count_lines_fast(f)
-                  data_rows = max(total_lines - 1, 0)
-                  per_family[f.stem] += data_rows
+                  total = count_lines_fast(f)
+                  rows = max(total - 1, 0)
+                  per_family[f.stem] += rows
 
               for fam, rows in sorted(per_family.items()):
-                  expected_lines.append(f"{fam}\t{ym}\t{rows}")
+                  expected.append(f"{fam}\t{ym}\t{rows}")
 
-              print(f"OK mes {ym}: familias={len(per_family)} archivos={len(csvs)}")
+              print(f"OK month {ym}: families={len(per_family)} files={len(csvs)}")
 
-          (tmp/"expected.tsv").write_text("\n".join(expected_lines) + "\n", encoding="utf-8")
-          print("OK: tmp/expected.tsv creado")
+          (tmp / "expected.tsv").write_text("\n".join(expected) + "\n", encoding="utf-8")
+          print("OK expected.tsv")
           PY
 
-      # 4) Normalizar headers + schema TODO STRING + guardar CSV limpio en data/
-      - name: Normalizar headers + schema TODO STRING
+      - name: Normalize headers and write clean CSV + schema
         shell: bash
         run: |
           set -euo pipefail
@@ -144,7 +141,8 @@ jobs:
 
           MONTHS = os.environ["MONTHS"].split()
           tmp  = Path("tmp")
-          data = Path("data"); data.mkdir(exist_ok=True)
+          data = Path("data")
+          data.mkdir(exist_ok=True)
 
           def norm_name(s: str) -> str:
               s = s.strip().replace("/", "_").replace(" ", "_").replace("-", "_")
@@ -194,22 +192,21 @@ jobs:
 
                   total += 1
 
-          print(f"OK: CSVs limpios creados: {total}")
+          print(f"OK clean CSV created: {total}")
           PY
 
-      # 4.1) Cache: expected.tsv -> ¿se generó CSV limpio?
-      - name: Cache: expected -> CSV limpio existe
+      - name: Cache missing clean CSV expected by ZIP
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, re
+          import re
           from pathlib import Path
 
           tmp = Path("tmp")
           data = Path("data")
-          err = tmp/"errors.txt"
-          tsv = tmp/"expected.tsv"
+          err = tmp / "errors.txt"
+          tsv = tmp / "expected.tsv"
 
           def log(code, msg):
               err.open("a", encoding="utf-8").write(f"{code}\t{msg}\n")
@@ -217,7 +214,7 @@ jobs:
           def norm_name(s: str) -> str:
               s = s.strip().replace("/", "_").replace(" ", "_").replace("-", "_")
               s = re.sub(r"[^A-Za-z0-9_]", "_", s)
-              s = re.sub(r"_+", "_").strip("_")
+              s = re.sub(r"_+", "_", s).strip("_")
               if not s:
                   s = "col"
               if s[0].isdigit():
@@ -225,33 +222,32 @@ jobs:
               return s
 
           if not tsv.exists():
-              log("EXPECTED_MISSING", "tmp/expected.tsv no existe")
+              log("EXPECTED_MISSING", "expected.tsv not found")
               raise SystemExit(0)
 
-          csv_tables = set(p.stem for p in data.glob("*.csv"))
+          have = set(p.stem for p in data.glob("*.csv"))
 
           missing = []
           for ln in tsv.read_text(encoding="utf-8").splitlines()[1:]:
               fam_raw, ym, _ = ln.split("\t")
-              y,m = ym.split("-")
+              y, m = ym.split("-")
               table = f"{norm_name(fam_raw)}_{y}_{m}"
-              if table not in csv_tables:
+              if table not in have:
                   missing.append(table)
 
           if missing:
-              log("MISSING_CSV_CLEAN", f"{len(missing)} tablas esperadas no generaron CSV limpio (ej: {missing[:25]})")
+              log("MISSING_CSV_CLEAN", f"{len(missing)} missing clean CSV (ex: {missing[:25]})")
 
-          print(f"CSV faltantes vs expected: {len(missing)}")
+          print(f"Missing clean CSV: {len(missing)}")
           PY
 
-      # 5) Cargar CSVs a BigQuery (cachea el error real)
-      - name: Cargar CSVs a BigQuery (cache fallas)
+      - name: Load all clean CSV to BigQuery and cache load failures
         shell: bash
         run: |
           set -u
+          shopt -s nullglob
           for csv in data/*.csv; do
             table=$(basename "$csv" .csv)
-
             out="$(bq --project_id="$PROJECT_ID" load \
               --replace \
               --source_format=CSV \
@@ -262,27 +258,26 @@ jobs:
               "$csv" \
               "data/$table.schema.json" 2>&1)"
             rc=$?
-
             if [ $rc -ne 0 ]; then
               echo -e "LOAD_FAIL\t$table\t$out" >> tmp/errors.txt
             fi
           done
+          echo "OK load step finished"
 
-      # 5.1) Cache: expected mensual -> existe en BQ y tiene filas
-      - name: Cache: expected mensual -> existe en BQ y tiene filas
+      - name: Cache expected monthly tables in BQ and zero rows
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
-          import os, re, subprocess
+          import re, subprocess, os
           from pathlib import Path
 
           PROJECT = os.environ["PROJECT_ID"]
           DATASET  = os.environ["DATASET"]
 
           tmp = Path("tmp")
-          err = tmp/"errors.txt"
-          tsv = tmp/"expected.tsv"
+          err = tmp / "errors.txt"
+          tsv = tmp / "expected.tsv"
 
           def log(code, msg):
               err.open("a", encoding="utf-8").write(f"{code}\t{msg}\n")
@@ -290,7 +285,7 @@ jobs:
           def norm_name(s: str) -> str:
               s = s.strip().replace("/", "_").replace(" ", "_").replace("-", "_")
               s = re.sub(r"[^A-Za-z0-9_]", "_", s)
-              s = re.sub(r"_+", "_").strip("_")
+              s = re.sub(r"_+", "_", s).strip("_")
               if not s:
                   s = "col"
               if s[0].isdigit():
@@ -298,37 +293,35 @@ jobs:
               return s
 
           if not tsv.exists():
-              log("EXPECTED_MISSING", "tmp/expected.tsv no existe (no se puede validar BQ)")
+              log("EXPECTED_MISSING", "expected.tsv not found for BQ check")
               raise SystemExit(0)
 
           q = f"SELECT table_id AS table_name, row_count FROM `{PROJECT}.{DATASET}.__TABLES__`"
-          out = subprocess.check_output(["bq","--project_id",PROJECT,"query","--use_legacy_sql=false","--format=csv", q], text=True)
+          out = subprocess.check_output(["bq","--project_id",PROJECT,"query","--use_legacy_sql=false","--format=csv",q], text=True)
           rows = [ln.split(",") for ln in out.splitlines()[1:] if ln.strip()]
           row_count = {t:int(rc) for t,rc in rows}
 
-          missing_bq = []
-          zero_rows  = []
+          missing = []
+          zero = []
 
           for ln in tsv.read_text(encoding="utf-8").splitlines()[1:]:
               fam_raw, ym, _ = ln.split("\t")
-              y,m = ym.split("-")
+              y, m = ym.split("-")
               table = f"{norm_name(fam_raw)}_{y}_{m}"
-
               if table not in row_count:
-                  missing_bq.append(table)
+                  missing.append(table)
               elif row_count[table] == 0:
-                  zero_rows.append(table)
+                  zero.append(table)
 
-          if missing_bq:
-              log("MISSING_BQ_MONTHLY", f"{len(missing_bq)} tablas esperadas no existen en BQ (ej: {missing_bq[:25]})")
-          if zero_rows:
-              log("ZERO_ROWS_MONTHLY", f"{len(zero_rows)} tablas esperadas con 0 filas (ej: {zero_rows[:25]})")
+          if missing:
+              log("MISSING_BQ_MONTHLY", f"{len(missing)} missing monthly in BQ (ex: {missing[:25]})")
+          if zero:
+              log("ZERO_ROWS_MONTHLY", f"{len(zero)} zero-row monthly (ex: {zero[:25]})")
 
-          print(f"Mensuales esperadas sin tabla BQ: {len(missing_bq)} | con 0 filas: {len(zero_rows)}")
+          print(f"Missing monthly in BQ: {len(missing)} | Zero rows: {len(zero)}")
           PY
 
-      # 6) Unión por familia (usa SOLO mensuales existentes, 1/2/3 meses OK)
-      - name: Unir tablas por familia (1/2/3 meses ok)
+      - name: Union by family using only existing monthly tables
         shell: bash
         run: |
           set -euo pipefail
@@ -339,8 +332,9 @@ jobs:
 
           PROJECT = os.environ["PROJECT_ID"]
           DATASET  = os.environ["DATASET"]
+
           tmp = Path("tmp")
-          err = tmp/"errors.txt"
+          err = tmp / "errors.txt"
 
           def log(code, msg):
               err.open("a", encoding="utf-8").write(f"{code}\t{msg}\n")
@@ -350,8 +344,7 @@ jobs:
           monthly = [t for t in tables if re.search(r'_\d{4}_\d{2}$', t)]
 
           if not monthly:
-              log("NO_MONTHLY_TABLES", "No hay tablas *_YYYY_MM para unir")
-              print("WARN: no hay mensuales para unir.")
+              log("NO_MONTHLY_TABLES", "no monthly tables to union")
               raise SystemExit(0)
 
           fams = defaultdict(list)
@@ -366,7 +359,10 @@ jobs:
               WHERE table_name = '{table}'
               ORDER BY ordinal_position
               """
-              out = subprocess.check_output(["bq","--project_id",PROJECT,"query","--use_legacy_sql=false","--format=csv",q], text=True)
+              out = subprocess.check_output(
+                  ["bq","--project_id",PROJECT,"query","--use_legacy_sql=false","--format=csv",q],
+                  text=True
+              )
               return [ln.strip() for ln in out.splitlines()[1:] if ln.strip()]
 
           for fam, ts in sorted(fams.items()):
@@ -400,13 +396,11 @@ jobs:
                   subprocess.check_call(["bq","--project_id",PROJECT,"query","--use_legacy_sql=false",final_sql])
               except subprocess.CalledProcessError as e:
                   log("UNION_FAIL", f"{fam}\t{e}")
-                  continue
 
-          print("OK: uniones ejecutadas.")
+          print("OK union done")
           PY
 
-      # 7) Cache: finales esperadas (según expected.tsv) vs finales existentes
-      - name: Cache: finales esperadas vs existentes
+      - name: Cache expected finals vs existing finals
         shell: bash
         run: |
           set -euo pipefail
@@ -416,9 +410,10 @@ jobs:
 
           PROJECT = os.environ["PROJECT_ID"]
           DATASET  = os.environ["DATASET"]
+
           tmp = Path("tmp")
-          err = tmp/"errors.txt"
-          tsv = tmp/"expected.tsv"
+          err = tmp / "errors.txt"
+          tsv = tmp / "expected.tsv"
 
           def log(code, msg):
               err.open("a", encoding="utf-8").write(f"{code}\t{msg}\n")
@@ -426,7 +421,7 @@ jobs:
           def norm_name(s: str) -> str:
               s = s.strip().replace("/", "_").replace(" ", "_").replace("-", "_")
               s = re.sub(r"[^A-Za-z0-9_]", "_", s)
-              s = re.sub(r"_+", "_").strip("_")
+              s = re.sub(r"_+", "_", s).strip("_")
               if not s:
                   s = "col"
               if s[0].isdigit():
@@ -434,36 +429,34 @@ jobs:
               return s
 
           if not tsv.exists():
-              log("EXPECTED_MISSING", "tmp/expected.tsv no existe (no se puede validar finales)")
+              log("EXPECTED_MISSING", "expected.tsv not found for finals check")
               raise SystemExit(0)
 
-          # esperado: familias que aparecen al menos una vez en expected.tsv
           expected_fams = set()
           for ln in tsv.read_text(encoding="utf-8").splitlines()[1:]:
               fam_raw, _, _ = ln.split("\t")
               expected_fams.add(norm_name(fam_raw))
 
           q = f"SELECT table_id AS table_name FROM `{PROJECT}.{DATASET}.__TABLES__`"
-          out = subprocess.check_output(["bq","--project_id",PROJECT,"query","--use_legacy_sql=false","--format=csv", q], text=True)
+          out = subprocess.check_output(["bq","--project_id",PROJECT,"query","--use_legacy_sql=false","--format=csv",q], text=True)
           actual = set(ln.strip() for ln in out.splitlines()[1:] if ln.strip())
-
           finals = set(t for t in actual if not re.search(r'_\d{4}_\d{2}$', t))
+
           missing = sorted(expected_fams - finals)
-
           if missing:
-              log("MISSING_FINAL", f"{len(missing)} finales esperadas no existen (ej: {missing[:50]})")
+              log("MISSING_FINAL", f"{len(missing)} missing finals (ex: {missing[:50]})")
 
-          print(f"Finales esperadas: {len(expected_fams)} | finales reales: {len(finals)} | faltan: {len(missing)}")
+          print(f"Expected finals: {len(expected_fams)} | Actual finals: {len(finals)} | Missing finals: {len(missing)}")
           PY
 
-      # 8) Reporte corto (sin spam)
-      - name: Reporte (tmp/errors.txt)
+      - name: Report
         shell: bash
         run: |
           set -euo pipefail
-          echo "=== RESUMEN ==="
+          echo "==== tmp/errors.txt ===="
           if [ -s tmp/errors.txt ]; then
             sed -n '1,200p' tmp/errors.txt
+            exit 1
           else
-            echo "OK: no se detectaron fallas cacheables."
+            echo "OK no cacheable issues found"
           fi
