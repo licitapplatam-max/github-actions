@@ -45,7 +45,6 @@ jobs:
           PROJECT = os.environ["PROJECT_ID"]
           DATASET  = os.environ["DATASET"]
 
-          # Lista TODO: tablas y vistas (sin paginación)
           q = f"""
           SELECT table_name, table_type
           FROM `{PROJECT}.{DATASET}.INFORMATION_SCHEMA.TABLES`
@@ -64,7 +63,6 @@ jobs:
           for r in rows:
               name = r["table_name"]
               ttype = r["table_type"]  # BASE TABLE / VIEW
-              # bq rm: -t para tabla, -v para vista
               flag = "-v" if ttype.upper() == "VIEW" else "-t"
               print(f"Borrando: {DATASET}.{name} ({ttype})")
               subprocess.check_call(["bq","--project_id",PROJECT,"rm","-f",flag,f"{DATASET}.{name}"])
@@ -137,8 +135,7 @@ jobs:
               for fam, rows in sorted(per_family.items()):
                   expected_lines.append(f"{fam}\t{ym}\t{rows}")
 
-              # resumen corto
-              keys = ["records", "releases", "ten_tenderers", "parties"]
+              keys = ["records", "releases", "ten_tenderers", "parties", "com_parties", "com_ten_tenderers"]
               present_keys = [k for k in keys if k in per_family]
               month_summary.append((ym, len(per_family), present_keys))
 
@@ -150,6 +147,12 @@ jobs:
 
           print("OK: tmp/expected.tsv creado")
           PY
+
+      - name: Mostrar expected.tsv (primeras 120 líneas)
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -n '1,120p' tmp/expected.tsv
 
       # 4) Normalizar headers + schema TODO STRING + CSV limpio en data/
       - name: Normalizar headers + schema TODO STRING
@@ -188,6 +191,7 @@ jobs:
               return fixed
 
           created = 0
+          sample = []
 
           for ym in MONTHS:
               y, m = ym.split("-")
@@ -195,7 +199,6 @@ jobs:
               src_dir = tmp / f"unzipped_{y}_{m}"
 
               for src in sorted(src_dir.glob("*.csv")):
-                  # OJO: OECE usa nombres estables, pero igual dejamos norm_name por seguridad.
                   base = norm_name(src.stem)
                   table = f"{base}_{suffix}"
 
@@ -214,8 +217,13 @@ jobs:
                   (data / f"{table}.schema.json").write_text(json.dumps(schema), encoding="utf-8")
 
                   created += 1
+                  if len(sample) < 12:
+                      sample.append(out_csv.name)
 
           print(f"OK: CSVs limpios creados: {created}")
+          print("Muestra (12):")
+          for s in sample:
+              print(" -", s)
           PY
 
       # 5) Cargar CSVs a BigQuery (captura real de fallas)
@@ -286,11 +294,8 @@ jobs:
           DATASET  = os.environ["DATASET"]
 
           expected_path = Path("tmp/expected.tsv")
-          if not expected_path.exists():
-              raise SystemExit("No existe tmp/expected.tsv")
-
-          # Expected monthly tables (según ZIP)
           exp_tables = set()
+
           for ln in expected_path.read_text(encoding="utf-8").splitlines()[1:]:
               if not ln.strip():
                   continue
@@ -298,7 +303,6 @@ jobs:
               y, m = ym.split("-")
               exp_tables.add(f"{fam}_{y}_{m}")
 
-          # Real monthly tables (SIN paginación)
           q = f"""
           SELECT table_name
           FROM `{PROJECT}.{DATASET}.INFORMATION_SCHEMA.TABLES`
@@ -311,14 +315,11 @@ jobs:
           real_monthly = set([ln.strip() for ln in out.splitlines()[1:] if ln.strip()])
 
           missing = sorted(exp_tables - real_monthly)
-
           Path("tmp/missing_monthly_tables.txt").write_text("\n".join(missing) + ("\n" if missing else ""), encoding="utf-8")
 
           print("=== GATE POST-LOAD ===")
           print(f"expected_monthly={len(exp_tables)} real_monthly={len(real_monthly)} missing={len(missing)}")
 
-          # No todos los CSV tienen 3 meses y eso está OK porque expected.tsv ya lo refleja.
-          # SOLO fallamos si falta algo que el ZIP sí trajo.
           if missing:
               print("--- FALTAN TABLAS MENSUALES QUE EL ZIP SÍ TRAJO (primeros 120) ---")
               for t in missing[:120]:
@@ -340,7 +341,6 @@ jobs:
           PROJECT = os.environ["PROJECT_ID"]
           DATASET  = os.environ["DATASET"]
 
-          # Sacar todas las tablas mensuales reales (sin paginación)
           q = f"""
           SELECT table_name
           FROM `{PROJECT}.{DATASET}.INFORMATION_SCHEMA.TABLES`
@@ -408,7 +408,7 @@ jobs:
           print("OK: unión completa por familia.")
           PY
 
-          # 7) Verificación final (existencia + numRows) para claves
+      # 7) Verificación final (existencia + numRows) para claves
       - name: Verificación final (focus: existencia + numRows)
         shell: bash
         run: |
@@ -419,7 +419,7 @@ jobs:
           PROJECT = os.environ["PROJECT_ID"]
           DATASET  = os.environ["DATASET"]
 
-          focus = ["records", "releases", "ten_tenderers", "parties"]
+          focus = ["records", "releases", "ten_tenderers", "parties", "com_parties", "com_ten_tenderers"]
 
           def bq_show(table):
               try:
@@ -439,3 +439,11 @@ jobs:
               else:
                   print(f"{t}: OK numRows={meta.get('numRows','NA')}")
           PY
+
+      # 8) Artifact: para descargar tmp/ y ver TODO
+      - name: Subir artefacto de diagnóstico (tmp/)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seace_diagnostico_tmp
+          path: tmp/
