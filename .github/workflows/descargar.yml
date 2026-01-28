@@ -515,7 +515,7 @@ jobs:
           sed -n '1,200p' tmp/monthly_gone_after_union.txt || true
 
       # Paso 7: Verificación rápida (existencia + numRows) para claves
-      - name: Verificación final (focus: existencia + numRows)
+      - name: Verificación final (focus - existencia + numRows)
         shell: bash
         run: |
           set -euxo pipefail
