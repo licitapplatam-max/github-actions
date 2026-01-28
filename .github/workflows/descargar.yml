@@ -408,7 +408,7 @@ jobs:
           print("OK: unión completa por familia.")
           PY
 
-      # 7) Verificación final (existencia + numRows) para claves
+          # 7) Verificación final (existencia + numRows) para claves
       - name: Verificación final (focus: existencia + numRows)
         shell: bash
         run: |
@@ -436,18 +436,6 @@ jobs:
               meta = bq_show(t)
               if not meta:
                   print(f"{t}: NO_EXISTE")
-                  continue
-              print(f"{t}: OK numRows={meta.get('numRows','NA')}")
+              else:
+                  print(f"{t}: OK numRows={meta.get('numRows','NA')}")
           PY
-
-      # 8) Artifact: para que NO llores por "dónde está tmp/*.txt"
-      - name: Subir artefacto de diagnóstico (tmp/)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: seace_diagnostico_tmp
-          path: |
-            tmp/expected.tsv
-            tmp/bq_load_ok.txt
-            tmp/bq_load_errors.log
-            tmp/missing_monthly_tables.txt
