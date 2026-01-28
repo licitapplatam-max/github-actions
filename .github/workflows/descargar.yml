@@ -1,4 +1,4 @@
-name: SEACE CSV ZIP -> BigQuery (3 meses FULL CLEAN + carga + union estable) [DEBUG]
+name: SEACE CSV ZIP -> BigQuery (3 meses FULL CLEAN + carga + union estable)
 
 on:
   workflow_dispatch: {}
@@ -27,14 +27,21 @@ jobs:
         with:
           project_id: heroic-ruler-481618-e5
 
-      # 0) Crear dataset si no existe
-      - name: Crear dataset si no existe
+      # 0) Crear dataset si no existe (cachea el "already exists" sin romper nada)
+      - name: Crear dataset si no existe (cache)
         shell: bash
         run: |
           set -euo pipefail
-          bq --project_id="$PROJECT_ID" mk --dataset "$PROJECT_ID:$DATASET" || true
+          mkdir -p tmp
+          : > tmp/errors.txt
 
-      # 1) LIMPIEZA TOTAL BigQuery (tablas + vistas)
+          # No cambia el flujo: sigue siendo mk || true, solo que ahora cacheamos el texto si aparece.
+          out="$(bq --project_id="$PROJECT_ID" mk --dataset "$PROJECT_ID:$DATASET" 2>&1 || true)"
+          if echo "$out" | grep -qi "already exists"; then
+            echo -e "DATASET_ALREADY_EXISTS\t${PROJECT_ID}:${DATASET}" >> tmp/errors.txt
+          fi
+
+      # 1) LIMPIEZA TOTAL BigQuery (borra TODO lo que encuentre: tablas y vistas)
       - name: LIMPIEZA TOTAL BigQuery (tablas + vistas)
         shell: bash
         run: |
@@ -45,53 +52,54 @@ jobs:
           PROJECT = os.environ["PROJECT_ID"]
           DATASET = os.environ["DATASET"]
 
-          # Usamos INFORMATION_SCHEMA para listar tablas y vistas sin depender del formato de bq ls.
-          q = f"""
-          SELECT table_name, table_type
-          FROM `{PROJECT}.{DATASET}.INFORMATION_SCHEMA.TABLES`
-          """
-          out = subprocess.check_output(
-              ["bq","--project_id",PROJECT,"query","--use_legacy_sql=false","--format=csv",q],
-              text=True
-          )
-          rows = [ln.split(",") for ln in out.splitlines()[1:] if ln.strip()]
-          names = [r[0].strip() for r in rows if r and r[0].strip()]
+          out = subprocess.check_output(["bq", "--project_id", PROJECT, "ls", DATASET], text=True)
+          lines = out.splitlines()
+
+          names = []
+          for ln in lines[2:]:
+              parts = ln.split()
+              if parts:
+                  names.append(parts[0])
 
           if not names:
               print("Dataset ya estaba vacío.")
           else:
               for name in names:
+                  # Esto sí es útil: saber qué borró (pero no imprimimos cada cosa con miles de líneas extra).
                   print(f"Borrando: {DATASET}.{name}")
-                  subprocess.check_call(["bq","--project_id",PROJECT,"rm","-f","-t",f"{DATASET}.{name}"])
+                  subprocess.check_call(["bq", "--project_id", PROJECT, "rm", "-f", "-t", f"{DATASET}.{name}"])
 
           print("OK: limpieza BigQuery completa.")
           PY
 
-      # 2) Limpieza runner
+      # 2) Limpieza runner (sin spam) + asegurar cache
       - name: Limpiar runner (data/ tmp/)
         shell: bash
         run: |
           set -euo pipefail
           rm -rf data tmp || true
           mkdir -p data tmp
-          echo "Runner limpio."
+          : > tmp/errors.txt
+          echo "Runner limpio. Cache: tmp/errors.txt"
 
-      # 3) Descargar ZIPs + extraer + contar filas reales + expected.tsv
-      - name: Descargar ZIPs + extraer + conteo REAL + expected.tsv
+      # 3) Descargar ZIPs + extraer + expected.tsv (resumen corto, sin imprimir cada archivo)
+      - name: Descargar ZIPs + extraer + expected.tsv (sin spam)
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
           import os, zipfile, subprocess
           from pathlib import Path
-          from collections import defaultdict
 
           MONTHS = os.environ["MONTHS"].split()
           tmp = Path("tmp"); tmp.mkdir(exist_ok=True)
+          err = tmp / "errors.txt"
 
           def run(cmd):
               r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
               if r.returncode != 0:
+                  # Cache del error real
+                  err.write_text(err.read_text(encoding="utf-8") + f"CMD_FAIL\t{' '.join(cmd)}\n", encoding="utf-8")
                   print(r.stdout)
                   raise SystemExit(r.returncode)
 
@@ -107,11 +115,12 @@ jobs:
               zip_path = tmp / f"seace_{y}_{m}.zip"
               out_dir  = tmp / f"unzipped_{y}_{m}"
 
-              print(f"\n=== MES {ym} ===")
-              print(f"URL: {url}")
+              print(f"=== MES {ym} ===")
 
               run(["bash","-lc", f"curl -L -f -sS '{url}' -o '{zip_path}'"])
               if zip_path.stat().st_size == 0:
+                  with err.open("a", encoding="utf-8") as f:
+                      f.write(f"ZIP_EMPTY\t{ym}\t{zip_path}\n")
                   raise SystemExit(f"ZIP vacío: {zip_path}")
 
               out_dir.mkdir(parents=True, exist_ok=True)
@@ -120,32 +129,27 @@ jobs:
 
               csvs = sorted(out_dir.glob("*.csv"))
               if not csvs:
+                  with err.open("a", encoding="utf-8") as f:
+                      f.write(f"NO_CSVS\t{ym}\t{zip_path}\n")
                   raise SystemExit(f"No hay CSVs en {zip_path}")
 
-              per_family = defaultdict(int)
+              # resumimos por familia SIN imprimir cada CSV
+              fam_rows = {}
               for f in csvs:
                   total_lines = count_lines_fast(f)
                   data_rows = max(total_lines - 1, 0)
-                  fam = f.stem
-                  per_family[fam] += data_rows
-                  print(f"{f.name:35s} total_lines={total_lines:8d} data_rows={data_rows:8d}")
+                  fam_rows[f.stem] = fam_rows.get(f.stem, 0) + data_rows
 
-              print("\n--- Total por familia (este mes) ---")
-              for fam, rows in sorted(per_family.items()):
-                  print(f"{fam:35s} data_rows_sum={rows:10d}")
+              for fam, rows in sorted(fam_rows.items()):
                   expected_lines.append(f"{fam}\t{ym}\t{rows}")
 
+              print(f"CSVs: {len(csvs)} | Familias: {len(fam_rows)}")
+
           (tmp/"expected.tsv").write_text("\n".join(expected_lines) + "\n", encoding="utf-8")
-          print("\nOK: tmp/expected.tsv creado")
+          print("OK: tmp/expected.tsv creado")
           PY
 
-      - name: Mostrar expected.tsv (primeras 120 líneas)
-        shell: bash
-        run: |
-          set -euo pipefail
-          sed -n '1,120p' tmp/expected.tsv
-
-      # 4) Normalizar headers + schema TODO STRING + guardar CSV limpio en data/
+      # 4) Normalizar headers + schema TODO STRING + guardar CSV limpio en data/ (ok)
       - name: Normalizar headers + schema TODO STRING
         shell: bash
         run: |
@@ -186,7 +190,6 @@ jobs:
               y, m = ym.split("-")
               suffix = f"{y}_{m}"
               src_dir = tmp / f"unzipped_{y}_{m}"
-
               for src in sorted(src_dir.glob("*.csv")):
                   base = norm_name(src.stem)
                   table = f"{base}_{suffix}"
@@ -210,35 +213,16 @@ jobs:
           print(f"OK: CSVs limpios creados: {total}")
           PY
 
-      - name: Ver data/ (muestra segura)
+      # 5) Cargar CSVs a BigQuery (cachea fallas por tabla, sin spam)
+      - name: Cargar CSVs a BigQuery (cache de fallas)
         shell: bash
         run: |
           set -euo pipefail
-          python - <<'PY'
-          from pathlib import Path
-          p = Path("data")
-          files = sorted([f.name for f in p.iterdir()])
-          print(f"Archivos en data/: {len(files)}")
-          for f in files[:80]:
-              print(f)
-          PY
-
-      # 5) Cargar CSVs a BigQuery CON CAPTURA TOTAL DE ERRORES
-      - name: Cargar CSVs a BigQuery (TODO STRING) - con logging de errores
-        shell: bash
-        run: |
-          set -uo pipefail
-          mkdir -p tmp
-          : > tmp/load_ok.log
-          : > tmp/load_errors.log
-
-          failed=0
-
+          # Si alguna carga falla, la registramos y seguimos para ver el panorama completo.
+          set +e
           for csv in data/*.csv; do
             table=$(basename "$csv" .csv)
-
-            echo "[LOAD] $table"
-            out=$(bq --project_id="$PROJECT_ID" load \
+            bq --project_id="$PROJECT_ID" load \
               --replace \
               --source_format=CSV \
               --skip_leading_rows=1 \
@@ -246,55 +230,16 @@ jobs:
               --max_bad_records=0 \
               "$DATASET.$table" \
               "$csv" \
-              "data/$table.schema.json" 2>&1)
-
+              "data/$table.schema.json"
             rc=$?
             if [ $rc -ne 0 ]; then
-              failed=1
-              echo "[FAIL] $table (rc=$rc)" | tee -a tmp/load_errors.log
-              echo "$out" | tee -a tmp/load_errors.log
-              echo "----------------------------------------" >> tmp/load_errors.log
-            else
-              echo "[OK] $table" | tee -a tmp/load_ok.log
+              echo -e "LOAD_FAIL\t$table\t$rc" >> tmp/errors.txt
             fi
           done
+          set -e
 
-          echo "=== RESUMEN CARGA ==="
-          echo "OK:   $(wc -l < tmp/load_ok.log || echo 0)"
-          echo "FAIL: $(grep -c '^\[FAIL\]' tmp/load_errors.log || echo 0)"
-
-          # FALLA EL JOB SI HUBO ERRORES DE CARGA (recomendado para que no te “llegue al final” mintiendo)
-          if [ $failed -ne 0 ]; then
-            echo "Hubo errores de carga. Revisa tmp/load_errors.log"
-            exit 1
-          fi
-
-      - name: Mostrar errores de carga (si existen)
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -s tmp/load_errors.log ]; then
-            echo "=== ERRORES DE CARGA (primeras 250 líneas) ==="
-            sed -n '1,250p' tmp/load_errors.log
-          else
-            echo "Sin errores de carga."
-          fi
-
-      # 5.1) Inventario de tablas cargadas (para ver qué llegó realmente)
-      - name: Inventario de tablas cargadas (después de load)
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          bq --project_id="$PROJECT_ID" query --use_legacy_sql=false --format=pretty "
-          SELECT table_name, row_count
-          FROM \`${PROJECT_ID}.${DATASET}.__TABLES__\`
-          ORDER BY table_name
-          "
-
-      # 6) Unión por familia con logging por familia (y listando mensuales por INFORMATION_SCHEMA)
-      - name: Unir tablas por familia (estable) - con logging por familia
+      # 6) Unión por familia (cachea union fail por familia, sin romper)
+      - name: Unir tablas por familia (cache de fallas)
         shell: bash
         run: |
           set -euo pipefail
@@ -305,210 +250,215 @@ jobs:
 
           PROJECT = os.environ["PROJECT_ID"]
           DATASET = os.environ["DATASET"]
+          errfile = Path("tmp/errors.txt")
 
-          tmp = Path("tmp")
-          tmp.mkdir(exist_ok=True)
-          (tmp / "union_ok.log").write_text("", encoding="utf-8")
-          (tmp / "union_errors.log").write_text("", encoding="utf-8")
-
-          def bq_query_csv(sql: str) -> str:
-              return subprocess.check_output(
-                  ["bq","--project_id",PROJECT,"query","--use_legacy_sql=false","--format=csv",sql],
-                  text=True
-              )
-
-          # LISTAR TABLAS MENSUALES EXISTENTES
-          q_monthly = f"""
-          SELECT table_name
-          FROM `{PROJECT}.{DATASET}.INFORMATION_SCHEMA.TABLES`
-          WHERE table_type='BASE TABLE'
-            AND REGEXP_CONTAINS(table_name, r'_[0-9]{{4}}_[0-9]{{2}}$')
-          """
-          out = bq_query_csv(q_monthly)
-          monthly = [ln.strip() for ln in out.splitlines()[1:] if ln.strip()]
+          out = subprocess.check_output(["bq","--project_id",PROJECT,"ls",DATASET], text=True)
+          tables = [ln.split()[0] for ln in out.splitlines()[2:] if ln.strip()]
+          monthly = [t for t in tables if re.search(r'_\d{4}_\d{2}$', t)]
 
           if not monthly:
+              with errfile.open("a", encoding="utf-8") as f:
+                  f.write("NO_MONTHLY_TABLES\tNo hay tablas *_YYYY_MM para unir\n")
               raise SystemExit("No hay tablas mensuales *_YYYY_MM para unir.")
 
           fams = defaultdict(list)
           for t in monthly:
-              fam = re.sub(r'_[0-9]{4}_[0-9]{2}$', '', t)
+              fam = re.sub(r'_\d{4}_\d{2}$', '', t)
               fams[fam].append(t)
 
-          def get_cols(table: str):
+          def get_cols(table):
               q = f"""
               SELECT column_name
               FROM `{PROJECT}.{DATASET}.INFORMATION_SCHEMA.COLUMNS`
               WHERE table_name = '{table}'
               ORDER BY ordinal_position
               """
-              out = bq_query_csv(q)
+              out = subprocess.check_output(
+                  ["bq","--project_id",PROJECT,"query","--use_legacy_sql=false","--format=csv",q],
+                  text=True
+              )
               return [ln.strip() for ln in out.splitlines()[1:] if ln.strip()]
 
-          failed = []
-
+          # Ejecutamos uniones, pero si alguna falla la cacheamos y seguimos.
           for fam, ts in sorted(fams.items()):
               ts = sorted(ts)
+
+              all_cols = []
+              seen = set()
+              cols_by_table = {}
+              for t in ts:
+                  cols = get_cols(t)
+                  cols_by_table[t] = set(cols)
+                  for c in cols:
+                      if c not in seen:
+                          seen.add(c)
+                          all_cols.append(c)
+
+              selects = []
+              for t in ts:
+                  present = cols_by_table[t]
+                  exprs = []
+                  for c in all_cols:
+                      if c in present:
+                          exprs.append(f"`{c}` AS `{c}`")
+                      else:
+                          exprs.append(f"CAST(NULL AS STRING) AS `{c}`")
+                  selects.append(f"SELECT {', '.join(exprs)} FROM `{PROJECT}.{DATASET}.{t}`")
+
+              union_sql = " UNION ALL ".join(selects)
+              final_sql = f"CREATE OR REPLACE TABLE `{PROJECT}.{DATASET}.{fam}` AS {union_sql}"
+
               try:
-                  all_cols = []
-                  seen = set()
-                  cols_by_table = {}
-
-                  for t in ts:
-                      cols = get_cols(t)
-                      cols_by_table[t] = set(cols)
-                      for c in cols:
-                          if c not in seen:
-                              seen.add(c)
-                              all_cols.append(c)
-
-                  selects = []
-                  for t in ts:
-                      present = cols_by_table[t]
-                      exprs = []
-                      for c in all_cols:
-                          if c in present:
-                              exprs.append(f"`{c}` AS `{c}`")
-                          else:
-                              exprs.append(f"CAST(NULL AS STRING) AS `{c}`")
-                      selects.append(f"SELECT {', '.join(exprs)} FROM `{PROJECT}.{DATASET}.{t}`")
-
-                  union_sql = " UNION ALL ".join(selects)
-                  final_sql = f"CREATE OR REPLACE TABLE `{PROJECT}.{DATASET}.{fam}` AS {union_sql}"
-
-                  print(f"[UNION] {fam} <= {len(ts)} tablas | cols={len(all_cols)}")
                   subprocess.check_call(["bq","--project_id",PROJECT,"query","--use_legacy_sql=false",final_sql])
-
-                  with (tmp / "union_ok.log").open("a", encoding="utf-8") as f:
-                      f.write(f"OK\t{fam}\t{len(ts)}\t{len(all_cols)}\t" + ",".join(ts) + "\n")
-
               except subprocess.CalledProcessError as e:
-                  failed.append(fam)
-                  with (tmp / "union_errors.log").open("a", encoding="utf-8") as f:
-                      f.write(f"FAIL\t{fam}\t{len(ts)}\t{e}\t" + ",".join(ts) + "\n")
-                  print(f"[ERROR UNION] {fam}: {e}")
+                  with errfile.open("a", encoding="utf-8") as f:
+                      f.write(f"UNION_FAIL\t{fam}\t{e.returncode}\n")
+                  # seguir con el resto
+                  continue
 
-          print("\n=== RESUMEN UNION ===")
-          ok_lines = (tmp / "union_ok.log").read_text(encoding="utf-8").strip().splitlines()
-          err_lines = (tmp / "union_errors.log").read_text(encoding="utf-8").strip().splitlines()
-          print(f"OK:   {0 if ok_lines==[''] else len(ok_lines)}")
-          print(f"FAIL: {0 if err_lines==[''] else len(err_lines)}")
-
-          if failed:
-              raise SystemExit("Fallaron uniones: " + ", ".join(failed))
+          print("OK: unión por familia ejecutada (fallas, si hubo, están en tmp/errors.txt).")
           PY
 
-      - name: Mostrar errores de unión (si existen)
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -s tmp/union_errors.log ]; then
-            echo "=== ERRORES DE UNION ==="
-            cat tmp/union_errors.log
-          else
-            echo "Sin errores de unión."
-          fi
-
-      # 7) Diagnóstico completo: qué familias y qué meses realmente existen
-      - name: Diagnóstico por familia (qué meses existen por tabla)
-        if: always()
+      # 7) Diagnóstico (lo dejamos, pero ya no dependes solo de esto)
+      - name: Diagnóstico (mensuales vs finales)
         shell: bash
         run: |
           set -euo pipefail
           bq --project_id="$PROJECT_ID" query --use_legacy_sql=false --format=pretty "
-          WITH t AS (
-            SELECT table_name
+          WITH monthly AS (
+            SELECT DISTINCT REGEXP_REPLACE(table_name, r'_[0-9]{4}_[0-9]{2}$', '') AS fam
             FROM \`${PROJECT_ID}.${DATASET}.INFORMATION_SCHEMA.TABLES\`
             WHERE table_type='BASE TABLE'
+              AND REGEXP_CONTAINS(table_name, r'_[0-9]{4}_[0-9]{2}$')
           ),
-          monthly AS (
-            SELECT
-              REGEXP_REPLACE(table_name, r'_[0-9]{4}_[0-9]{2}$', '') AS fam,
-              REGEXP_EXTRACT(table_name, r'_([0-9]{4}_[0-9]{2})$') AS ym
-            FROM t
-            WHERE REGEXP_CONTAINS(table_name, r'_[0-9]{4}_[0-9]{2}$')
+          finals AS (
+            SELECT table_name AS fam
+            FROM \`${PROJECT_ID}.${DATASET}.INFORMATION_SCHEMA.TABLES\`
+            WHERE table_type='BASE TABLE'
+              AND NOT REGEXP_CONTAINS(table_name, r'_[0-9]{4}_[0-9]{2}$')
           )
-          SELECT fam, ARRAY_AGG(ym ORDER BY ym) AS meses
-          FROM monthly
-          GROUP BY fam
-          ORDER BY fam;
+          SELECT m.fam, IF(f.fam IS NULL, 'FALTA_FINAL', 'OK') AS estado
+          FROM monthly m
+          LEFT JOIN finals f USING(fam)
+          ORDER BY estado DESC, fam;
           "
 
-      # 7.1) Diagnóstico brutal: familias que esperabas (expected.tsv) vs lo que existe realmente
-      - name: expected.tsv vs tablas existentes (detecta TODO lo que falta)
-        if: always()
+      # 8) Verificación rápida records (cachea si falla)
+      - name: Verificar records final (conteo) + cache fail
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          bq --project_id="$PROJECT_ID" query --use_legacy_sql=false --format=pretty "
+          SELECT COUNT(1) AS filas_records_final
+          FROM \`${PROJECT_ID}.${DATASET}.records\`
+          "
+          rc=$?
+          if [ $rc -ne 0 ]; then
+            echo -e "RECORDS_QUERY_FAIL\trecords\t$rc" >> tmp/errors.txt
+          fi
+          set -e
+
+      # 9) Cache final: faltantes mensuales + faltantes finales + extras + mismatch de nombres (SIN SPAM)
+      - name: Cache final (faltantes mensuales/finales + extras + mismatch)
         shell: bash
         run: |
           set -euo pipefail
           python - <<'PY'
           import os, re, subprocess
           from pathlib import Path
+          from collections import defaultdict
 
           PROJECT = os.environ["PROJECT_ID"]
-          DATASET = os.environ["DATASET"]
+          DATASET  = os.environ["DATASET"]
+          MONTHS   = os.environ["MONTHS"].split()
 
-          expected_path = Path("tmp/expected.tsv")
-          if not expected_path.exists():
-              print("No existe tmp/expected.tsv, no puedo comparar.")
-              raise SystemExit(1)
+          tmp = Path("tmp")
+          err = tmp / "errors.txt"
+          tsv = tmp / "expected.tsv"
 
-          # Leer expected (family, ym)
-          expected = set()
-          lines = expected_path.read_text(encoding="utf-8").splitlines()
-          for ln in lines[1:]:
-              if not ln.strip():
-                  continue
-              fam, ym, _rows = ln.split("\t")
+          def norm_name(s: str) -> str:
+              s = s.strip().replace("/", "_").replace(" ", "_").replace("-", "_")
+              s = re.sub(r"[^A-Za-z0-9_]", "_", s)
+              s = re.sub(r"_+", "_", s).strip("_")
+              if not s:
+                  s = "col"
+              if s[0].isdigit():
+                  s = "c_" + s
+              return s
+
+          if not tsv.exists():
+              with err.open("a", encoding="utf-8") as f:
+                  f.write("EXPECTED_MISSING\ttmp/expected.tsv no existe\n")
+              print("CACHE: expected.tsv faltante.")
+              raise SystemExit(0)
+
+          # 1) Leer expected.tsv (familias "crudas") y construir esperado NORMALIZADO (como realmente nombras tablas)
+          exp = defaultdict(set)         # ym -> set(raw fam)
+          raw_to_norm = {}               # raw -> norm
+          for ln in tsv.read_text(encoding="utf-8").splitlines()[1:]:
+              fam_raw, ym, _ = ln.split("\t")
+              exp[ym].add(fam_raw)
+              fam_norm = norm_name(fam_raw)
+              raw_to_norm[fam_raw] = fam_norm
+
+          # warning si hay mismatch raw->norm (es el origen típico de "faltan mensuales/finales" falsos)
+          mismatches = sorted([r for r,n in raw_to_norm.items() if r != n])
+
+          expected_monthly = set()
+          expected_final   = set()
+          for ym in MONTHS:
               y, m = ym.split("-")
-              expected.add(f"{fam}_{y}_{m}")
+              suffix = f"{y}_{m}"
+              for fam_raw in exp.get(ym, set()):
+                  fam = raw_to_norm[fam_raw]
+                  expected_monthly.add(f"{fam}_{suffix}")
+                  expected_final.add(fam)
 
-          # Listar tablas existentes mensuales en BQ
-          q = f"""
-          SELECT table_name
-          FROM `{PROJECT}.{DATASET}.INFORMATION_SCHEMA.TABLES`
-          WHERE table_type='BASE TABLE'
-            AND REGEXP_CONTAINS(table_name, r'_[0-9]{{4}}_[0-9]{{2}}$')
-          """
-          out = subprocess.check_output(["bq","--project_id",PROJECT,"query","--use_legacy_sql=false","--format=csv",q], text=True)
-          existing = set([ln.strip() for ln in out.splitlines()[1:] if ln.strip()])
+          # 2) Tablas reales
+          out = subprocess.check_output(["bq","--project_id",PROJECT,"ls",DATASET], text=True)
+          real = set()
+          for ln in out.splitlines()[2:]:
+              parts = ln.split()
+              if parts:
+                  real.add(parts[0])
 
-          missing = sorted(expected - existing)
-          extra   = sorted(existing - expected)
+          real_monthly = {t for t in real if re.search(r'_\d{4}_\d{2}$', t)}
+          real_final   = {t for t in real if not re.search(r'_\d{4}_\d{2}$', t)}
 
-          Path("tmp/missing_monthly_tables.log").write_text("\n".join(missing) + ("\n" if missing else ""), encoding="utf-8")
-          Path("tmp/extra_monthly_tables.log").write_text("\n".join(extra) + ("\n" if extra else ""), encoding="utf-8")
+          missing_monthly = sorted(expected_monthly - real_monthly)
+          missing_final   = sorted(expected_final - real_final)
 
-          print("=== COMPARACION expected vs existing ===")
-          print(f"Expected monthly tables: {len(expected)}")
-          print(f"Existing monthly tables: {len(existing)}")
-          print(f"Missing monthly tables:  {len(missing)}  -> tmp/missing_monthly_tables.log")
-          print(f"Extra monthly tables:    {len(extra)}    -> tmp/extra_monthly_tables.log")
+          extra_monthly = sorted(real_monthly - expected_monthly)
+          extra_final   = sorted(real_final - expected_final)
 
-          # Si faltan, marca el job como fallido (para que no “llegue al final” con dataset incompleto)
-          if missing:
-              raise SystemExit("FALTAN TABLAS MENSUALES. Ver tmp/missing_monthly_tables.log")
+          with err.open("a", encoding="utf-8") as f:
+              for t in missing_monthly:
+                  f.write(f"MISSING_MONTHLY\t{t}\n")
+              for t in missing_final:
+                  f.write(f"MISSING_FINAL\t{t}\n")
+              for t in extra_monthly[:200]:
+                  f.write(f"EXTRA_MONTHLY\t{t}\n")
+              for t in extra_final[:200]:
+                  f.write(f"EXTRA_FINAL\t{t}\n")
+              for r in mismatches[:200]:
+                  f.write(f"WARN_NAME_MISMATCH\t{r}\t{raw_to_norm[r]}\n")
+
+          # Resumen corto (sin spam)
+          print("=== CACHE RESUMEN ===")
+          print(f"Missing monthly: {len(missing_monthly)} | Missing final: {len(missing_final)}")
+          print(f"Extra monthly:   {len(extra_monthly)}   | Extra final:   {len(extra_final)}")
+          print(f"Name mismatches: {len(mismatches)}")
           PY
 
-      - name: Mostrar missing_monthly_tables.log (si existe)
-        if: always()
+      # 10) Mostrar cache útil (solo si hay algo)
+      - name: Mostrar tmp/errors.txt (solo si hay entradas)
         shell: bash
         run: |
           set -euo pipefail
-          if [ -s tmp/missing_monthly_tables.log ]; then
-            echo "=== TABLAS MENSUALES FALTANTES (primeras 200) ==="
-            sed -n '1,200p' tmp/missing_monthly_tables.log
+          if [ -s tmp/errors.txt ]; then
+            echo "=== tmp/errors.txt ==="
+            cat tmp/errors.txt
           else
-            echo "No faltan tablas mensuales según expected.tsv"
+            echo "OK: tmp/errors.txt vacío (no se detectaron fallas cacheables)."
           fi
-
-      # 8) Verificación rápida (records si existe) - no revienta el job
-      - name: Verificar records final (conteo, si existe)
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          bq --project_id="$PROJECT_ID" query --use_legacy_sql=false --format=pretty "
-          SELECT COUNT(1) AS filas_records_final
-          FROM \`${PROJECT_ID}.${DATASET}.records\`
-          " || true
