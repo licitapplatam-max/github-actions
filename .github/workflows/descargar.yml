@@ -48,8 +48,8 @@ jobs:
           set -euo pipefail
 
           # Asegura datasets (NO se borran)
-          bq --project_id="$PROJECT_ID" mk --dataset "$PROJECT_ID:$FINAL_DS" >/dev/null 2>&1 || true
-          bq --project_id="$PROJECT_ID" mk --dataset "$PROJECT_ID:$STG_DS"   >/dev/null 2>&1 || true
+          bq --quiet --project_id="$PROJECT_ID" mk --dataset "$PROJECT_ID:$FINAL_DS" >/dev/null 2>&1 || true
+          bq --quiet --project_id="$PROJECT_ID" mk --dataset "$PROJECT_ID:$STG_DS"   >/dev/null 2>&1 || true
 
           python -u - <<'PY'
           import os, json, subprocess, sys, time
@@ -67,51 +67,89 @@ jobs:
               print(out, flush=True)
               return r.returncode, out
 
+          def parse_json_loose(out: str):
+              """
+              BigQuery CLI a veces imprime basura junto con JSON.
+              Intentamos:
+              1) json.loads directo
+              2) recortar desde el primer '[' o '{' hasta el último ']' o '}'
+              """
+              s = (out or "").strip()
+              if not s:
+                  return None
+
+              try:
+                  return json.loads(s)
+              except Exception:
+                  pass
+
+              # Busca el primer inicio posible
+              starts = [i for i in [s.find("["), s.find("{")] if i != -1]
+              if not starts:
+                  return None
+              start = min(starts)
+              s2 = s[start:].strip()
+              if not s2:
+                  return None
+
+              end_char = "]" if s2[0] == "[" else "}"
+              end = s2.rfind(end_char)
+              if end != -1:
+                  s3 = s2[:end+1]
+                  try:
+                      return json.loads(s3)
+                  except Exception:
+                      return None
+              return None
+
           def list_objects(ds: str):
               cmd = [
-                  "bq", f"--project_id={PROJECT_ID}",
+                  "bq", "--quiet", f"--project_id={PROJECT_ID}",
                   "ls", "--max_results", str(LS_MAX_RESULTS),
-                  "--format=prettyjson",
+                  "--format=json",
                   f"{PROJECT_ID}:{ds}"
               ]
               rc, out = sh(cmd)
               if rc != 0:
                   return []
-              try:
-                  items = json.loads(out)
-                  return items if isinstance(items, list) else []
-              except Exception:
-                  print("[ERROR] bq ls no devolvió JSON válido. Abortando.", flush=True)
+
+              items = parse_json_loose(out)
+              if items is None:
+                  # Muestra un pedazo para debug, sin spamear
+                  snippet = (out or "")[:1200]
+                  print("[ERROR] bq ls no devolvió JSON parseable. Snippet:", flush=True)
+                  print(snippet, flush=True)
                   sys.exit(1)
+
+              return items if isinstance(items, list) else []
 
           def rm_object(ds: str, table_id: str, typ: str) -> int:
               """
               Borra un objeto intentando flags según el tipo.
               Incluye retry/backoff porque BigQuery a veces responde raro.
               """
-              # CORRECTO: sin f-string roto
               ref = f"{PROJECT_ID}:{ds}.{table_id}"
               typ = (typ or "").upper()
 
               if typ in ("VIEW", "MATERIALIZED_VIEW"):
                   attempts = [
-                      ["bq", f"--project_id={PROJECT_ID}", "rm", "-f", "-v", ref],
-                      ["bq", f"--project_id={PROJECT_ID}", "rm", "-f", "-t", ref],
+                      ["bq", "--quiet", f"--project_id={PROJECT_ID}", "rm", "-f", "-v", ref],
+                      ["bq", "--quiet", f"--project_id={PROJECT_ID}", "rm", "-f", "-t", ref],
                   ]
               elif typ == "MODEL":
                   attempts = [
-                      ["bq", f"--project_id={PROJECT_ID}", "rm", "-f", "-m", ref],
-                      ["bq", f"--project_id={PROJECT_ID}", "rm", "-f", "-t", ref],
+                      ["bq", "--quiet", f"--project_id={PROJECT_ID}", "rm", "-f", "-m", ref],
+                      ["bq", "--quiet", f"--project_id={PROJECT_ID}", "rm", "-f", "-t", ref],
                   ]
               elif typ == "ROUTINE":
                   attempts = [
-                      ["bq", f"--project_id={PROJECT_ID}", "rm", "-f", "-r", ref],
+                      ["bq", "--quiet", f"--project_id={PROJECT_ID}", "rm", "-f", "-r", ref],
                   ]
               else:
                   attempts = [
-                      ["bq", f"--project_id={PROJECT_ID}", "rm", "-f", "-t", ref],
-                      ["bq", f"--project_id={PROJECT_ID}", "rm", "-f", "-v", ref],
-                      ["bq", f"--project_id={PROJECT_ID}", "rm", "-f", "-m", ref],
+                      ["bq", "--quiet", f"--project_id={PROJECT_ID}", "rm", "-f", "-t", ref],
+                      ["bq", "--quiet", f"--project_id={PROJECT_ID}", "rm", "-f", "-v", ref],
+                      ["bq", "--quiet", f"--project_id={PROJECT_ID}", "rm", "-f", "-m", ref],
                   ]
 
               max_retries = 6
@@ -127,7 +165,7 @@ jobs:
                           return 0
 
                   sleep_s = 2 ** attempt_i
-                  print(f"[WARN] No se pudo borrar {ds}.{table_id} (type={typ}). Retry (ritrái) en {sleep_s}s...", flush=True)
+                  print(f"[WARN] No se pudo borrar {ds}.{table_id} (type={typ}). Retry en {sleep_s}s...", flush=True)
                   time.sleep(sleep_s)
 
               return 1
@@ -257,6 +295,31 @@ jobs:
                   time.sleep(2 ** i)
               return last
 
+          def parse_json_loose(out: str):
+              s = (out or "").strip()
+              if not s:
+                  return None
+              try:
+                  return json.loads(s)
+              except Exception:
+                  pass
+              starts = [i for i in [s.find("["), s.find("{")] if i != -1]
+              if not starts:
+                  return None
+              start = min(starts)
+              s2 = s[start:].strip()
+              if not s2:
+                  return None
+              end_char = "]" if s2[0] == "[" else "}"
+              end = s2.rfind(end_char)
+              if end != -1:
+                  s3 = s2[:end+1]
+                  try:
+                      return json.loads(s3)
+                  except Exception:
+                      return None
+              return None
+
           def safe_table_name(name_no_ext: str) -> str:
               t = re.sub(r"[^A-Za-z0-9_]", "_", name_no_ext)
               t = re.sub(r"_+", "_", t).strip("_")
@@ -299,7 +362,7 @@ jobs:
               HAVING COUNT(DISTINCT table_name) = {len(tables)}
               ORDER BY column_name
               """
-              rc, out = sh_retry(["bq", f"--project_id={PROJECT_ID}", "query", "--nouse_legacy_sql", "--format=csv", sql], tries=6)
+              rc, out = sh_retry(["bq", "--quiet", f"--project_id={PROJECT_ID}", "query", "--nouse_legacy_sql", "--format=csv", sql], tries=6)
               if rc != 0:
                   return []
               rows = [r.strip() for r in out.splitlines() if r.strip()]
@@ -308,20 +371,19 @@ jobs:
               return []
 
           def bq_list_tables(ds: str) -> list[str]:
-              rc, out = sh_retry(["bq", f"--project_id={PROJECT_ID}", "ls", "--max_results", "5000", "--format=prettyjson", f"{PROJECT_ID}:{ds}"], tries=4)
+              cmd = ["bq", "--quiet", f"--project_id={PROJECT_ID}", "ls", "--max_results", "5000", "--format=json", f"{PROJECT_ID}:{ds}"]
+              rc, out = sh_retry(cmd, tries=4)
               if rc != 0:
                   return []
-              try:
-                  items = json.loads(out)
-              except:
+              items = parse_json_loose(out)
+              if not isinstance(items, list):
                   return []
               names = []
-              if isinstance(items, list):
-                  for it in items:
-                      ref = it.get("tableReference") or {}
-                      tid = ref.get("tableId")
-                      if tid:
-                          names.append(tid)
+              for it in items:
+                  ref = (it or {}).get("tableReference") or {}
+                  tid = ref.get("tableId")
+                  if tid:
+                      names.append(tid)
               return sorted(set(names))
 
           zip_files = sorted(glob.glob(os.path.join(ZIPS_DIR, "seace_????_??.zip")))
@@ -383,7 +445,7 @@ jobs:
                       json.dump(schema, s)
 
                   cmd = [
-                      "bq", f"--project_id={PROJECT_ID}", "load",
+                      "bq", "--quiet", f"--project_id={PROJECT_ID}", "load",
                       "--source_format=CSV",
                       "--skip_leading_rows=1",
                       "--allow_quoted_newlines",
@@ -412,13 +474,12 @@ jobs:
               stg_list = sorted([t for t in stg_tables_by_logical.get(logical, []) if t])
 
               if not stg_list:
-                  # crea tabla final vacía PERO existente
                   sql = f"""
                   CREATE OR REPLACE TABLE `{PROJECT_ID}.{FINAL_DS}.{logical}` AS
                   SELECT CAST(NULL AS STRING) AS anio_mes
                   WHERE 1=0
                   """
-                  rc, _ = sh_retry(["bq", f"--project_id={PROJECT_ID}", "query", "--nouse_legacy_sql", sql], tries=6)
+                  rc, _ = sh_retry(["bq", "--quiet", f"--project_id={PROJECT_ID}", "query", "--nouse_legacy_sql", sql], tries=6)
                   if rc != 0:
                       print(f"[ERROR] No se pudo crear tabla vacía: {FINAL_DS}.{logical}", flush=True)
                       sys.exit(1)
@@ -461,7 +522,7 @@ jobs:
               {("\nUNION ALL\n").join(union_parts)}
               """
 
-              rc, _ = sh_retry(["bq", f"--project_id={PROJECT_ID}", "query", "--nouse_legacy_sql", final_sql], tries=6)
+              rc, _ = sh_retry(["bq", "--quiet", f"--project_id={PROJECT_ID}", "query", "--nouse_legacy_sql", final_sql], tries=6)
               if rc != 0:
                   print(f"[ERROR] crear final falló para {logical}", flush=True)
                   sys.exit(1)
@@ -476,7 +537,7 @@ jobs:
           out_path = os.path.join(REPORT_DIR, "final_lineage.json")
           with open(out_path, "w", encoding="utf-8") as f:
               json.dump(lineage, f, ensure_ascii=False, indent=2)
-          print(f"\nOK: Lineage (lín-iach) guardado en {out_path}", flush=True)
+          print(f"\nOK: Lineage guardado en {out_path}", flush=True)
 
           print("\n==============================", flush=True)
           print("FASE 3: VERIFICACIÓN FINAL (22 EXACTAS)", flush=True)
@@ -513,7 +574,7 @@ jobs:
           for logical, stg_list in stg_tables_by_logical.items():
               for t in stg_list:
                   ref = f"{PROJECT_ID}:{STG_DS}.{t}"
-                  rc, out = sh_retry(["bq", f"--project_id={PROJECT_ID}", "rm", "-f", "-t", ref], tries=6)
+                  rc, _ = sh_retry(["bq", "--quiet", f"--project_id={PROJECT_ID}", "rm", "-f", "-t", ref], tries=6)
                   if rc == 0:
                       dropped += 1
 
