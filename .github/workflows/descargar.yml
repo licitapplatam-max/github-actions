@@ -58,7 +58,7 @@ jobs:
           FINAL_DS   = os.environ["FINAL_DS"]
           STG_DS     = os.environ["STG_DS"]
 
-          # Ajusta si tu dataset tiene demasiados objetos
+          # Para no quedarnos con el "50 default" del bq ls
           LS_MAX_RESULTS = 5000
 
           def sh(cmd):
@@ -68,9 +68,12 @@ jobs:
               return r.returncode, out
 
           def list_objects(ds: str):
-              # --max_results reduce el “misterio” de por qué a veces ves 50
-              cmd = ["bq", f"--project_id={PROJECT_ID}", "ls", "--max_results", str(LS_MAX_RESULTS),
-                     "--format=prettyjson", f"{PROJECT_ID}:{ds}"]
+              cmd = [
+                  "bq", f"--project_id={PROJECT_ID}",
+                  "ls", "--max_results", str(LS_MAX_RESULTS),
+                  "--format=prettyjson",
+                  f"{PROJECT_ID}:{ds}"
+              ]
               rc, out = sh(cmd)
               if rc != 0:
                   return []
@@ -78,17 +81,15 @@ jobs:
                   items = json.loads(out)
                   return items if isinstance(items, list) else []
               except Exception:
-                  # Si el JSON se rompe por logs raros, no seguimos ciegos
                   print("[ERROR] bq ls no devolvió JSON válido. Abortando.", flush=True)
                   sys.exit(1)
 
           def rm_object(ds: str, table_id: str, typ: str) -> int:
               """
               Borra un objeto intentando flags según el tipo.
-              Incluye retry con backoff porque BigQuery a veces se hace el gracioso.
+              Incluye retry/backoff porque BigQuery a veces responde raro.
               """
-              ref = f"{PROJECT_ID}:{ds}.{table_id"
-              # fix: placeholder to avoid accidental unclosed var? We'll build properly below
+              # CORRECTO: sin f-string roto
               ref = f"{PROJECT_ID}:{ds}.{table_id}"
               typ = (typ or "").upper()
 
@@ -107,42 +108,38 @@ jobs:
                       ["bq", f"--project_id={PROJECT_ID}", "rm", "-f", "-r", ref],
                   ]
               else:
-                  # TABLE u objeto “raro”
                   attempts = [
                       ["bq", f"--project_id={PROJECT_ID}", "rm", "-f", "-t", ref],
                       ["bq", f"--project_id={PROJECT_ID}", "rm", "-f", "-v", ref],
                       ["bq", f"--project_id={PROJECT_ID}", "rm", "-f", "-m", ref],
                   ]
 
-              # Retry por “errores transitorios”
-              max_retries = 5
+              max_retries = 6
               for attempt_i in range(max_retries):
-                  # intentamos las variantes por tipo
                   for cmd in attempts:
                       rc, out = sh(cmd)
                       if rc == 0:
                           return 0
 
-                      # Si el objeto ya no existe, lo consideramos OK
                       low = (out or "").lower()
-                      if "not found" in low or "no such" in low or "does not exist" in low:
+                      # Si ya no existe, lo damos por borrado
+                      if ("not found" in low) or ("no such" in low) or ("does not exist" in low):
                           return 0
 
-                  # backoff (1,2,4,8,16)
                   sleep_s = 2 ** attempt_i
-                  print(f"[WARN] No se pudo borrar {ds}.{table_id} (type={typ}). Retry en {sleep_s}s...", flush=True)
+                  print(f"[WARN] No se pudo borrar {ds}.{table_id} (type={typ}). Retry (ritrái) en {sleep_s}s...", flush=True)
                   time.sleep(sleep_s)
 
               return 1
 
           def wipe_dataset_objects(ds: str):
               """
-              Limpia TODO objeto del dataset en rondas (porque borrar en masa falla a veces).
-              NO borra el dataset.
+              Limpia TODO objeto del dataset en rondas.
+              NO borra el dataset, solo objetos.
               """
               print(f"\n=== LIMPIANDO DATASET {PROJECT_ID}:{ds} (solo objetos) ===", flush=True)
 
-              max_rounds = 8
+              max_rounds = 10
               for round_i in range(1, max_rounds + 1):
                   items = list_objects(ds)
                   print(f"Ronda {round_i}/{max_rounds} | Objetos encontrados: {len(items)}", flush=True)
@@ -151,7 +148,6 @@ jobs:
                       print(f"OK: {ds} ya está vacío.", flush=True)
                       return
 
-                  # Borrado
                   failures = []
                   for it in items:
                       ref = it.get("tableReference") or {}
@@ -164,21 +160,17 @@ jobs:
                       if rm_object(ds, table_id, typ) != 0:
                           failures.append((table_id, typ))
 
-                  # Si hubo fallos, no nos hacemos los locos
                   if failures:
-                      print(f"[WARN] Fallaron {len(failures)} borrados en {ds}. Se re-lista en la siguiente ronda.", flush=True)
+                      print(f"[WARN] Fallaron {len(failures)} borrados en {ds}. Se reintenta en siguiente ronda.", flush=True)
 
-                  # Re-lista para ver si queda algo
                   remaining = list_objects(ds)
                   print(f"Objetos restantes después de ronda {round_i}: {len(remaining)}", flush=True)
                   if not remaining:
                       print(f"OK: {ds} quedó vacío.", flush=True)
                       return
 
-                  # Pausa pequeña entre rondas
                   time.sleep(3)
 
-              # Si llegamos aquí: no quedó vacío tras muchas rondas
               remaining = list_objects(ds)
               print(f"[ERROR] Limpieza incompleta tras {max_rounds} rondas. No se continúa.", flush=True)
               for it in remaining:
@@ -255,13 +247,15 @@ jobs:
               print(out, flush=True)
               return r.returncode, out
 
-          def sh_retry(cmd, tries=5):
+          def sh_retry(cmd, tries=6):
+              last = (1, "")
               for i in range(tries):
                   rc, out = sh(cmd)
+                  last = (rc, out)
                   if rc == 0:
                       return 0, out
                   time.sleep(2 ** i)
-              return rc, out
+              return last
 
           def safe_table_name(name_no_ext: str) -> str:
               t = re.sub(r"[^A-Za-z0-9_]", "_", name_no_ext)
@@ -305,7 +299,7 @@ jobs:
               HAVING COUNT(DISTINCT table_name) = {len(tables)}
               ORDER BY column_name
               """
-              rc, out = sh_retry(["bq", f"--project_id={PROJECT_ID}", "query", "--nouse_legacy_sql", "--format=csv", sql], tries=5)
+              rc, out = sh_retry(["bq", f"--project_id={PROJECT_ID}", "query", "--nouse_legacy_sql", "--format=csv", sql], tries=6)
               if rc != 0:
                   return []
               rows = [r.strip() for r in out.splitlines() if r.strip()]
@@ -401,7 +395,7 @@ jobs:
                       out_csv
                   ]
                   print(f"STG load: {ym} | {base} -> {PROJECT_ID}:{stg_full}", flush=True)
-                  rc, _ = sh_retry(cmd, tries=5)
+                  rc, _ = sh_retry(cmd, tries=6)
                   if rc != 0:
                       print(f"[ERROR] Falló staging load: {stg_full}", flush=True)
                       sys.exit(1)
@@ -424,7 +418,7 @@ jobs:
                   SELECT CAST(NULL AS STRING) AS anio_mes
                   WHERE 1=0
                   """
-                  rc, _ = sh_retry(["bq", f"--project_id={PROJECT_ID}", "query", "--nouse_legacy_sql", sql], tries=5)
+                  rc, _ = sh_retry(["bq", f"--project_id={PROJECT_ID}", "query", "--nouse_legacy_sql", sql], tries=6)
                   if rc != 0:
                       print(f"[ERROR] No se pudo crear tabla vacía: {FINAL_DS}.{logical}", flush=True)
                       sys.exit(1)
@@ -467,7 +461,7 @@ jobs:
               {("\nUNION ALL\n").join(union_parts)}
               """
 
-              rc, _ = sh_retry(["bq", f"--project_id={PROJECT_ID}", "query", "--nouse_legacy_sql", final_sql], tries=5)
+              rc, _ = sh_retry(["bq", f"--project_id={PROJECT_ID}", "query", "--nouse_legacy_sql", final_sql], tries=6)
               if rc != 0:
                   print(f"[ERROR] crear final falló para {logical}", flush=True)
                   sys.exit(1)
@@ -482,7 +476,7 @@ jobs:
           out_path = os.path.join(REPORT_DIR, "final_lineage.json")
           with open(out_path, "w", encoding="utf-8") as f:
               json.dump(lineage, f, ensure_ascii=False, indent=2)
-          print(f"\nOK: Lineage guardado en {out_path}", flush=True)
+          print(f"\nOK: Lineage (lín-iach) guardado en {out_path}", flush=True)
 
           print("\n==============================", flush=True)
           print("FASE 3: VERIFICACIÓN FINAL (22 EXACTAS)", flush=True)
@@ -519,7 +513,7 @@ jobs:
           for logical, stg_list in stg_tables_by_logical.items():
               for t in stg_list:
                   ref = f"{PROJECT_ID}:{STG_DS}.{t}"
-                  rc, out = sh_retry(["bq", f"--project_id={PROJECT_ID}", "rm", "-f", "-t", ref], tries=5)
+                  rc, out = sh_retry(["bq", f"--project_id={PROJECT_ID}", "rm", "-f", "-t", ref], tries=6)
                   if rc == 0:
                       dropped += 1
 
