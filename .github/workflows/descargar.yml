@@ -3,7 +3,6 @@ name: SEACE CSV ZIP -> BigQuery (staging mensual + UNION final, sin mezcla)
 on:
   workflow_dispatch: {}
 
-# Evita que 2 ejecuciones del mismo workflow se pisen (no mezcla).
 concurrency:
   group: seace-bq-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -16,10 +15,22 @@ jobs:
       PROJECT_ID: heroic-ruler-481618-e5
       FINAL_DS: github_actions
       STG_DS: github_actions_stg
-      # Puedes poner 2, 3 o más. Formato estricto YYYY-MM separados por coma.
       MONTHS: "2026-01,2025-12,2025-11"
 
     steps:
+      # STEP 0: si esto no aparece, el workflow ni está siendo reconocido
+      - name: STEP 0 - Arranque y diagnóstico básico
+        shell: bash
+        run: |
+          set -euxo pipefail
+          echo "Workflow arrancó."
+          echo "Runner:"
+          uname -a
+          echo "PWD:"
+          pwd
+          echo "Repo files:"
+          ls -lah
+
       - name: Checkout (chék-aut)
         uses: actions/checkout@v4
 
@@ -33,56 +44,36 @@ jobs:
         with:
           project_id: ${{ env.PROJECT_ID }}
 
-      # 1) Limpieza local SOLO al inicio
       - name: Limpieza local inicial (tmp/ data/)
         shell: bash
         run: |
           set -euxo pipefail
           mkdir -p tmp/zips tmp/unzipped data
           rm -rf tmp/zips/* tmp/unzipped/* data/* || true
-          echo "OK: Limpieza local inicial lista"
 
-      # 2) Preparar datasets y limpiar tablas SOLO al inicio
       - name: Preparar datasets y limpiar tablas BigQuery (solo inicio)
         shell: bash
         run: |
           set -euxo pipefail
-
-          # Asegura datasets
           bq --project_id="$PROJECT_ID" mk --dataset "$PROJECT_ID:$FINAL_DS" || true
           bq --project_id="$PROJECT_ID" mk --dataset "$PROJECT_ID:$STG_DS"   || true
 
-          # Borrar tablas del FINAL
           FINAL_TABLES=$(bq --project_id="$PROJECT_ID" ls --format=csv --max_results=100000 "$PROJECT_ID:$FINAL_DS" \
             | tail -n +2 | cut -d, -f1 || true)
-
           if [ -n "${FINAL_TABLES}" ]; then
-            echo "Borrando tablas en $FINAL_DS"
             while IFS= read -r t; do
-              echo "  - $FINAL_DS.$t"
               bq --project_id="$PROJECT_ID" rm -f -t "$PROJECT_ID:$FINAL_DS.$t" || true
             done <<< "${FINAL_TABLES}"
-          else
-            echo "No hay tablas que borrar en $FINAL_DS"
           fi
 
-          # Borrar tablas del STAGING
           STG_TABLES=$(bq --project_id="$PROJECT_ID" ls --format=csv --max_results=100000 "$PROJECT_ID:$STG_DS" \
             | tail -n +2 | cut -d, -f1 || true)
-
           if [ -n "${STG_TABLES}" ]; then
-            echo "Borrando tablas en $STG_DS"
             while IFS= read -r t; do
-              echo "  - $STG_DS.$t"
               bq --project_id="$PROJECT_ID" rm -f -t "$PROJECT_ID:$STG_DS.$t" || true
             done <<< "${STG_TABLES}"
-          else
-            echo "No hay tablas que borrar en $STG_DS"
           fi
 
-          echo "OK: Limpieza BigQuery inicial terminada"
-
-      # 3) Descarga con retries + verificación brutal (si no hay zips, muere aquí)
       - name: Descargar ZIPs SEACE (retries + verificación)
         shell: bash
         run: |
@@ -90,18 +81,11 @@ jobs:
           mkdir -p tmp/zips
 
           IFS=',' read -r -a MONTH_LIST <<< "$MONTHS"
-          if [ "${#MONTH_LIST[@]}" -eq 0 ]; then
-            echo "MONTHS vacío. Define al menos 1 mes."
-            exit 1
-          fi
+          test "${#MONTH_LIST[@]}" -gt 0
 
           for ym in "${MONTH_LIST[@]}"; do
             ym="$(echo "$ym" | xargs)"
-
-            if ! [[ "$ym" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
-              echo "Formato inválido en MONTHS: '$ym' (esperado YYYY-MM)"
-              exit 1
-            fi
+            [[ "$ym" =~ ^[0-9]{4}-[0-9]{2}$ ]]
 
             YEAR="${ym%-*}"
             MONTH="${ym#*-}"
@@ -109,43 +93,18 @@ jobs:
             URL="https://contratacionesabiertas.oece.gob.pe/api/v1/file/seace_v3/csv/${YEAR}/${MONTH}"
             ZIP="tmp/zips/seace_${YEAR}_${MONTH}.zip"
 
-            echo "Descargando $ym -> $ZIP"
-            curl -L -f -sS \
-              --retry 6 --retry-all-errors --retry-delay 2 \
-              "$URL" -o "$ZIP"
-
+            curl -L -f -sS --retry 6 --retry-all-errors --retry-delay 2 "$URL" -o "$ZIP"
             test -s "$ZIP"
-            file "$ZIP" | grep -Ei "zip|archive" >/dev/null
           done
 
-          echo "ZIPs descargados:"
           ls -lah tmp/zips
-
           COUNT=$(ls -1 tmp/zips/*.zip 2>/dev/null | wc -l)
-          echo "ZIP count: $COUNT"
           test "$COUNT" -gt 0
 
-      # 4) Debug extra antes de procesar (para que no vuelvas a “no hay zips”)
-      - name: Debug: verificar tmp/ antes de Python
-        shell: bash
-        run: |
-          set -euxo pipefail
-          echo "PWD:"
-          pwd
-          echo "Contenido tmp/:"
-          ls -lah tmp || true
-          echo "Contenido tmp/zips/:"
-          ls -lah tmp/zips || true
-          COUNT=$(ls -1 tmp/zips/*.zip 2>/dev/null | wc -l || true)
-          echo "ZIP count: $COUNT"
-          test "$COUNT" -gt 0
-
-      # 5) Staging mensual + UNION final en BigQuery (BigQuery hace la unión)
       - name: Cargar staging por mes + crear tablas finales (UNION en BigQuery)
         shell: bash
         run: |
           set -euxo pipefail
-
           python - <<'PY'
           import os, re, glob, shutil, subprocess, sys
           from collections import defaultdict
@@ -168,85 +127,59 @@ jobs:
 
           def normalize_headers_line(header: str):
               cols = header.rstrip("\n\r").split(",")
-              fixed = []
-              seen = {}
+              fixed, seen = [], {}
               for c in cols:
                   c = c.strip()
                   c = c.replace("/", "_").replace(" ", "_").replace("-", "_")
                   c = re.sub(r"[^A-Za-z0-9_]", "_", c)
                   c = re.sub(r"_+", "_", c).strip("_")
-                  if not c:
-                      c = "col"
-                  if c[0].isdigit():
-                      c = "c_" + c
-
+                  if not c: c = "col"
+                  if c[0].isdigit(): c = "c_" + c
                   base = c
                   k = seen.get(base, 0)
-                  if k > 0:
-                      c = f"{base}_{k}"
+                  if k > 0: c = f"{base}_{k}"
                   seen[base] = k + 1
                   fixed.append(c)
-
               return ",".join(fixed) + "\n"
 
           def safe_table_name(name_no_ext: str) -> str:
               t = re.sub(r"[^A-Za-z0-9_]", "_", name_no_ext)
               t = re.sub(r"_+", "_", t).strip("_")
-              if not t:
-                  t = "tabla"
-              if t[0].isdigit():
-                  t = "t_" + t
+              if not t: t = "tabla"
+              if t[0].isdigit(): t = "t_" + t
               return t
 
-          # Descubre ZIPs reales descargados
           zip_files = sorted(glob.glob(os.path.join(ZIPS_DIR, "seace_????_??.zip")))
           if not zip_files:
               print("[ERROR] No hay ZIPs en tmp/zips.")
-              print("tmp/:", os.listdir("tmp") if os.path.exists("tmp") else "tmp/ no existe")
-              print("tmp/zips/:", os.listdir(ZIPS_DIR) if os.path.exists(ZIPS_DIR) else "tmp/zips no existe")
               sys.exit(1)
 
           stg_tables_by_logical = defaultdict(list)
 
-          # 1) Cargar staging por mes
           for zip_path in zip_files:
               m = re.search(r"seace_(\d{4})_(\d{2})\.zip$", os.path.basename(zip_path))
               if not m:
-                  print(f"[WARN] ZIP con nombre inesperado, se ignora: {zip_path}")
+                  print(f"[WARN] ZIP con nombre raro, se ignora: {zip_path}")
                   continue
-
               year, month = m.group(1), m.group(2)
               ym = f"{year}-{month}"
 
-              if os.path.getsize(zip_path) == 0:
-                  print(f"[ERROR] ZIP vacío: {zip_path}")
-                  sys.exit(1)
-
-              print("\n==============================")
-              print(f"== STAGING MES: {ym}")
-              print("==============================")
-
-              # Limpieza local entre meses (evita mezcla de archivos)
               shutil.rmtree(UNZIP_DIR, ignore_errors=True)
               shutil.rmtree(DATA_DIR, ignore_errors=True)
               os.makedirs(UNZIP_DIR, exist_ok=True)
               os.makedirs(DATA_DIR, exist_ok=True)
 
-              # Unzip
               rc, _ = sh(["unzip", "-o", zip_path, "-d", UNZIP_DIR])
-              if rc != 0:
-                  sys.exit(rc)
+              if rc != 0: sys.exit(rc)
 
               csv_paths = sorted(glob.glob(os.path.join(UNZIP_DIR, "**", "*.csv"), recursive=True))
               if not csv_paths:
-                  print(f"[WARN] No hay CSVs en {ym}. Se salta ese mes.")
+                  print(f"[WARN] No hay CSVs en {ym}")
                   continue
 
               for src in csv_paths:
                   base = os.path.basename(src)
                   logical = safe_table_name(os.path.splitext(base)[0])
-
-                  # Tabla staging mensual
                   stg_table = f"{logical}__{year}_{month}"
                   stg_full  = f"{STG_DS}.{stg_table}"
                   out_clean = os.path.join(DATA_DIR, f"{stg_table}.csv")
@@ -254,14 +187,12 @@ jobs:
                   with open(src, "rb") as f:
                       b = f.read().replace(b"\x00", b"")
                   lines = b.decode("utf-8", errors="replace").splitlines(True)
-                  if not lines:
-                      continue
+                  if not lines: continue
 
                   norm_header = normalize_headers_line(lines[0]).strip()
                   new_lines = [f"anio_mes,{norm_header}\n"]
                   for line in lines[1:]:
-                      if line.strip() == "":
-                          continue
+                      if line.strip() == "": continue
                       new_lines.append(f"{ym}," + line)
 
                   with open(out_clean, "w", encoding="utf-8", newline="") as g:
@@ -279,31 +210,22 @@ jobs:
                       stg_full,
                       out_clean
                   ]
-
-                  print(f"\n=== STAGING load: {base} -> {PROJECT_ID}:{stg_full} ===")
                   rc, _ = sh(cmd)
                   if rc != 0:
-                      print(f"[ERROR] Falló staging load: {src} -> {stg_full}")
+                      print(f"[ERROR] staging load falló: {src} -> {stg_full}")
                       sys.exit(rc)
 
                   stg_tables_by_logical[logical].append(stg_table)
 
           if not stg_tables_by_logical:
-              print("[ERROR] No se cargó ninguna tabla staging. Nada que consolidar.")
+              print("[ERROR] No se cargó nada a staging.")
               sys.exit(1)
 
-          # 2) Crear tablas finales: UNION ALL en BigQuery, usando SOLO columnas comunes
           for logical, stg_list in stg_tables_by_logical.items():
               stg_list = [t for t in stg_list if t]
-              if not stg_list:
-                  continue
-
-              print("\n==============================")
-              print(f"== FINAL TABLE: {PROJECT_ID}.{FINAL_DS}.{logical}")
-              print("==============================")
+              if not stg_list: continue
 
               table_names_sql = ", ".join([f"'{t}'" for t in stg_list])
-
               q_cols = f"""
               SELECT column_name
               FROM `{PROJECT_ID}.{STG_DS}.INFORMATION_SCHEMA.COLUMNS`
@@ -314,53 +236,29 @@ jobs:
               ORDER BY column_name
               """
 
-              rc, out = sh([
-                  "bq", f"--project_id={PROJECT_ID}", "query",
-                  "--nouse_legacy_sql",
-                  "--format=csv",
-                  q_cols
-              ])
+              rc, out = sh(["bq", f"--project_id={PROJECT_ID}", "query", "--nouse_legacy_sql", "--format=csv", q_cols])
               if rc != 0:
-                  print(f"[ERROR] No se pudo obtener columnas comunes para {logical}")
+                  print(f"[ERROR] info_schema falló para {logical}")
                   sys.exit(rc)
 
               rows = [r.strip() for r in out.splitlines() if r.strip()]
               common_cols = rows[1:] if len(rows) >= 2 else []
 
-              select_exprs = ["anio_mes"]
-              for c in common_cols:
-                  select_exprs.append(f"CAST({c} AS STRING) AS {c}")
-
-              union_parts = []
-              for t in stg_list:
-                  union_parts.append(
-                      "SELECT " + ", ".join(select_exprs) + f" FROM `{PROJECT_ID}.{STG_DS}.{t}`"
-                  )
+              select_exprs = ["anio_mes"] + [f"CAST({c} AS STRING) AS {c}" for c in common_cols]
+              union_parts = [
+                  "SELECT " + ", ".join(select_exprs) + f" FROM `{PROJECT_ID}.{STG_DS}.{t}`"
+                  for t in stg_list
+              ]
 
               final_sql = f"""
               CREATE OR REPLACE TABLE `{PROJECT_ID}.{FINAL_DS}.{logical}` AS
               {("\nUNION ALL\n").join(union_parts)}
               """
 
-              rc, _ = sh([
-                  "bq", f"--project_id={PROJECT_ID}", "query",
-                  "--nouse_legacy_sql",
-                  final_sql
-              ])
+              rc, _ = sh(["bq", f"--project_id={PROJECT_ID}", "query", "--nouse_legacy_sql", final_sql])
               if rc != 0:
-                  print(f"[ERROR] Falló creación final para {logical}")
+                  print(f"[ERROR] crear final falló para {logical}")
                   sys.exit(rc)
 
-          # 3) Limpieza staging al final (opcional pero recomendable)
-          print("\n== Limpieza staging (drop tables) ==")
-          for logical, stg_list in stg_tables_by_logical.items():
-              for t in stg_list:
-                  rc, _ = sh([
-                      "bq", f"--project_id={PROJECT_ID}", "rm",
-                      "-f", "-t", f"{PROJECT_ID}:{STG_DS}.{t}"
-                  ])
-                  if rc != 0:
-                      print(f"[WARN] No se pudo borrar staging {STG_DS}.{t} (se continúa)")
-
-          print("\nOK: Proceso terminado sin mezcla. Final creado con UNION ALL en BigQuery.")
+          print("OK")
           PY
