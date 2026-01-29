@@ -42,7 +42,7 @@ jobs:
           mkdir -p tmp/zips tmp/unzipped data reports
           rm -rf tmp/zips/* tmp/unzipped/* data/* reports/* || true
 
-      - name: Limpieza BigQuery (FINAL y STG) antes de cargar (HARD, solo tablas/objetos)
+      - name: Limpieza BigQuery (FINAL y STG) antes de cargar (HARD, solo objetos) - via API
         shell: bash
         run: |
           set -euo pipefail
@@ -51,173 +51,135 @@ jobs:
           bq --quiet --project_id="$PROJECT_ID" mk --dataset "$PROJECT_ID:$FINAL_DS" >/dev/null 2>&1 || true
           bq --quiet --project_id="$PROJECT_ID" mk --dataset "$PROJECT_ID:$STG_DS"   >/dev/null 2>&1 || true
 
+          # Instala cliente oficial para no depender del CLI bq ls
+          python -m pip install --quiet --disable-pip-version-check google-cloud-bigquery
+
           python -u - <<'PY'
-          import os, json, subprocess, sys, time
+          import os, sys, time
+          from google.cloud import bigquery
+          from google.api_core.exceptions import NotFound, TooManyRequests, ServiceUnavailable, Forbidden, BadRequest, Conflict
 
           PROJECT_ID = os.environ["PROJECT_ID"]
           FINAL_DS   = os.environ["FINAL_DS"]
           STG_DS     = os.environ["STG_DS"]
 
-          # Para no quedarnos con el "50 default" del bq ls
-          LS_MAX_RESULTS = 5000
+          client = bigquery.Client(project=PROJECT_ID)
 
-          def sh(cmd):
-              r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-              out = r.stdout or ""
-              print(out, flush=True)
-              return r.returncode, out
-
-          def parse_json_loose(out: str):
+          def retry(fn, what: str, max_retries: int = 8):
               """
-              BigQuery CLI a veces imprime basura junto con JSON.
-              Intentamos:
-              1) json.loads directo
-              2) recortar desde el primer '[' o '{' hasta el último ']' o '}'
+              Retry (ritrái) con backoff (bák-óf) exponencial para errores transitorios.
               """
-              s = (out or "").strip()
-              if not s:
-                  return None
+              for i in range(max_retries):
+                  try:
+                      return fn()
+                  except (TooManyRequests, ServiceUnavailable, Conflict) as e:
+                      sleep_s = 2 ** i
+                      print(f"[WARN] {what} falló por {type(e).__name__}. Retry en {sleep_s}s...", flush=True)
+                      time.sleep(sleep_s)
+              # último intento sin esconder el error
+              return fn()
 
+          def wipe_dataset_objects(ds: str):
+              print(f"\n=== LIMPIANDO DATASET {PROJECT_ID}:{ds} (solo objetos) ===", flush=True)
+              dataset_ref = bigquery.DatasetReference(PROJECT_ID, ds)
+
+              # 1) RUTINAS (routines)
+              routines = []
               try:
-                  return json.loads(s)
+                  routines = list(client.list_routines(dataset_ref))
+              except Exception as e:
+                  print(f"[WARN] No se pudo listar routines en {ds}: {e}", flush=True)
+
+              # 2) MODELOS (models)
+              models = []
+              try:
+                  models = list(client.list_models(dataset_ref))
+              except Exception as e:
+                  print(f"[WARN] No se pudo listar models en {ds}: {e}", flush=True)
+
+              # 3) TABLAS/VISTAS (tables/views/materialized views)
+              tables = []
+              try:
+                  tables = list(client.list_tables(dataset_ref))
+              except NotFound:
+                  # Si el dataset no existe, lo tratamos como vacío (pero arriba lo “mk” ya lo asegura)
+                  print(f"[WARN] Dataset {ds} no existe al listar tables. Se asume vacío.", flush=True)
+                  return
+              except Exception as e:
+                  print(f"[ERROR] No se pudo listar tables en {ds}: {e}", flush=True)
+                  sys.exit(1)
+
+              print(f"Encontrados -> routines: {len(routines)} | models: {len(models)} | tables/views: {len(tables)}", flush=True)
+
+              # BORRADO: primero routines, luego models, luego tables
+              # (Orden defensivo por dependencias raras)
+
+              for r in routines:
+                  rid = getattr(r, "routine_id", None) or getattr(r, "routineId", None) or str(r)
+                  def _del_r():
+                      return client.delete_routine(r.reference)  # type: ignore
+                  try:
+                      retry(_del_r, f"delete routine {ds}.{rid}")
+                      print(f"Borrado routine: {ds}.{rid}", flush=True)
+                  except NotFound:
+                      pass
+                  except (Forbidden, BadRequest) as e:
+                      print(f"[ERROR] No se pudo borrar routine {ds}.{rid}: {e}", flush=True)
+                      sys.exit(1)
+
+              for m in models:
+                  mid = getattr(m, "model_id", None) or getattr(m, "modelId", None) or str(m)
+                  def _del_m():
+                      return client.delete_model(m.reference)  # type: ignore
+                  try:
+                      retry(_del_m, f"delete model {ds}.{mid}")
+                      print(f"Borrado model: {ds}.{mid}", flush=True)
+                  except NotFound:
+                      pass
+                  except (Forbidden, BadRequest) as e:
+                      print(f"[ERROR] No se pudo borrar model {ds}.{mid}: {e}", flush=True)
+                      sys.exit(1)
+
+              for t in tables:
+                  tid = t.table_id
+                  def _del_t():
+                      return client.delete_table(t.reference, not_found_ok=True)  # type: ignore
+                  try:
+                      retry(_del_t, f"delete table {ds}.{tid}")
+                      print(f"Borrado table: {ds}.{tid}", flush=True)
+                  except (Forbidden, BadRequest) as e:
+                      print(f"[ERROR] No se pudo borrar table {ds}.{tid}: {e}", flush=True)
+                      sys.exit(1)
+
+              # Verificación final (re-lista)
+              tables2 = list(client.list_tables(dataset_ref))
+              models2 = []
+              routines2 = []
+              try:
+                  models2 = list(client.list_models(dataset_ref))
+              except Exception:
+                  pass
+              try:
+                  routines2 = list(client.list_routines(dataset_ref))
               except Exception:
                   pass
 
-              # Busca el primer inicio posible
-              starts = [i for i in [s.find("["), s.find("{")] if i != -1]
-              if not starts:
-                  return None
-              start = min(starts)
-              s2 = s[start:].strip()
-              if not s2:
-                  return None
-
-              end_char = "]" if s2[0] == "[" else "}"
-              end = s2.rfind(end_char)
-              if end != -1:
-                  s3 = s2[:end+1]
-                  try:
-                      return json.loads(s3)
-                  except Exception:
-                      return None
-              return None
-
-          def list_objects(ds: str):
-              cmd = [
-                  "bq", "--quiet", f"--project_id={PROJECT_ID}",
-                  "ls", "--max_results", str(LS_MAX_RESULTS),
-                  "--format=json",
-                  f"{PROJECT_ID}:{ds}"
-              ]
-              rc, out = sh(cmd)
-              if rc != 0:
-                  return []
-
-              items = parse_json_loose(out)
-              if items is None:
-                  # Muestra un pedazo para debug, sin spamear
-                  snippet = (out or "")[:1200]
-                  print("[ERROR] bq ls no devolvió JSON parseable. Snippet:", flush=True)
-                  print(snippet, flush=True)
+              if tables2 or models2 or routines2:
+                  print(f"[ERROR] Limpieza incompleta en {ds}. Restan -> routines:{len(routines2)} models:{len(models2)} tables:{len(tables2)}", flush=True)
+                  if tables2:
+                      for x in tables2[:50]:
+                          print(f"  - {ds}.{x.table_id} (table/view)", flush=True)
+                  if models2:
+                      for x in models2[:50]:
+                          mid = getattr(x, "model_id", None) or str(x)
+                          print(f"  - {ds}.{mid} (model)", flush=True)
+                  if routines2:
+                      for x in routines2[:50]:
+                          rid = getattr(x, "routine_id", None) or str(x)
+                          print(f"  - {ds}.{rid} (routine)", flush=True)
                   sys.exit(1)
 
-              return items if isinstance(items, list) else []
-
-          def rm_object(ds: str, table_id: str, typ: str) -> int:
-              """
-              Borra un objeto intentando flags según el tipo.
-              Incluye retry/backoff porque BigQuery a veces responde raro.
-              """
-              ref = f"{PROJECT_ID}:{ds}.{table_id}"
-              typ = (typ or "").upper()
-
-              if typ in ("VIEW", "MATERIALIZED_VIEW"):
-                  attempts = [
-                      ["bq", "--quiet", f"--project_id={PROJECT_ID}", "rm", "-f", "-v", ref],
-                      ["bq", "--quiet", f"--project_id={PROJECT_ID}", "rm", "-f", "-t", ref],
-                  ]
-              elif typ == "MODEL":
-                  attempts = [
-                      ["bq", "--quiet", f"--project_id={PROJECT_ID}", "rm", "-f", "-m", ref],
-                      ["bq", "--quiet", f"--project_id={PROJECT_ID}", "rm", "-f", "-t", ref],
-                  ]
-              elif typ == "ROUTINE":
-                  attempts = [
-                      ["bq", "--quiet", f"--project_id={PROJECT_ID}", "rm", "-f", "-r", ref],
-                  ]
-              else:
-                  attempts = [
-                      ["bq", "--quiet", f"--project_id={PROJECT_ID}", "rm", "-f", "-t", ref],
-                      ["bq", "--quiet", f"--project_id={PROJECT_ID}", "rm", "-f", "-v", ref],
-                      ["bq", "--quiet", f"--project_id={PROJECT_ID}", "rm", "-f", "-m", ref],
-                  ]
-
-              max_retries = 6
-              for attempt_i in range(max_retries):
-                  for cmd in attempts:
-                      rc, out = sh(cmd)
-                      if rc == 0:
-                          return 0
-
-                      low = (out or "").lower()
-                      # Si ya no existe, lo damos por borrado
-                      if ("not found" in low) or ("no such" in low) or ("does not exist" in low):
-                          return 0
-
-                  sleep_s = 2 ** attempt_i
-                  print(f"[WARN] No se pudo borrar {ds}.{table_id} (type={typ}). Retry en {sleep_s}s...", flush=True)
-                  time.sleep(sleep_s)
-
-              return 1
-
-          def wipe_dataset_objects(ds: str):
-              """
-              Limpia TODO objeto del dataset en rondas.
-              NO borra el dataset, solo objetos.
-              """
-              print(f"\n=== LIMPIANDO DATASET {PROJECT_ID}:{ds} (solo objetos) ===", flush=True)
-
-              max_rounds = 10
-              for round_i in range(1, max_rounds + 1):
-                  items = list_objects(ds)
-                  print(f"Ronda {round_i}/{max_rounds} | Objetos encontrados: {len(items)}", flush=True)
-
-                  if not items:
-                      print(f"OK: {ds} ya está vacío.", flush=True)
-                      return
-
-                  failures = []
-                  for it in items:
-                      ref = it.get("tableReference") or {}
-                      table_id = ref.get("tableId")
-                      typ = it.get("type", "TABLE")
-                      if not table_id:
-                          continue
-
-                      print(f"Borrando: {ds}.{table_id} (type={typ})", flush=True)
-                      if rm_object(ds, table_id, typ) != 0:
-                          failures.append((table_id, typ))
-
-                  if failures:
-                      print(f"[WARN] Fallaron {len(failures)} borrados en {ds}. Se reintenta en siguiente ronda.", flush=True)
-
-                  remaining = list_objects(ds)
-                  print(f"Objetos restantes después de ronda {round_i}: {len(remaining)}", flush=True)
-                  if not remaining:
-                      print(f"OK: {ds} quedó vacío.", flush=True)
-                      return
-
-                  time.sleep(3)
-
-              remaining = list_objects(ds)
-              print(f"[ERROR] Limpieza incompleta tras {max_rounds} rondas. No se continúa.", flush=True)
-              for it in remaining:
-                  ref = it.get("tableReference") or {}
-                  table_id = ref.get("tableId")
-                  typ = it.get("type", "TABLE")
-                  if table_id:
-                      print(f"  - {ds}.{table_id} (type={typ})", flush=True)
-              sys.exit(1)
+              print(f"OK: {ds} quedó vacío.", flush=True)
 
           wipe_dataset_objects(FINAL_DS)
           wipe_dataset_objects(STG_DS)
@@ -295,31 +257,6 @@ jobs:
                   time.sleep(2 ** i)
               return last
 
-          def parse_json_loose(out: str):
-              s = (out or "").strip()
-              if not s:
-                  return None
-              try:
-                  return json.loads(s)
-              except Exception:
-                  pass
-              starts = [i for i in [s.find("["), s.find("{")] if i != -1]
-              if not starts:
-                  return None
-              start = min(starts)
-              s2 = s[start:].strip()
-              if not s2:
-                  return None
-              end_char = "]" if s2[0] == "[" else "}"
-              end = s2.rfind(end_char)
-              if end != -1:
-                  s3 = s2[:end+1]
-                  try:
-                      return json.loads(s3)
-                  except Exception:
-                      return None
-              return None
-
           def safe_table_name(name_no_ext: str) -> str:
               t = re.sub(r"[^A-Za-z0-9_]", "_", name_no_ext)
               t = re.sub(r"_+", "_", t).strip("_")
@@ -371,19 +308,21 @@ jobs:
               return []
 
           def bq_list_tables(ds: str) -> list[str]:
-              cmd = ["bq", "--quiet", f"--project_id={PROJECT_ID}", "ls", "--max_results", "5000", "--format=json", f"{PROJECT_ID}:{ds}"]
-              rc, out = sh_retry(cmd, tries=4)
+              rc, out = sh_retry(["bq", "--quiet", f"--project_id={PROJECT_ID}", "ls", "--max_results", "5000", "--format=prettyjson", f"{PROJECT_ID}:{ds}"], tries=4)
               if rc != 0:
                   return []
-              items = parse_json_loose(out)
-              if not isinstance(items, list):
+              # En esta parte solo lo usamos para verificar finales (debería salir estable).
+              try:
+                  items = json.loads(out)
+              except Exception:
                   return []
               names = []
-              for it in items:
-                  ref = (it or {}).get("tableReference") or {}
-                  tid = ref.get("tableId")
-                  if tid:
-                      names.append(tid)
+              if isinstance(items, list):
+                  for it in items:
+                      ref = (it or {}).get("tableReference") or {}
+                      tid = ref.get("tableId")
+                      if tid:
+                          names.append(tid)
               return sorted(set(names))
 
           zip_files = sorted(glob.glob(os.path.join(ZIPS_DIR, "seace_????_??.zip")))
