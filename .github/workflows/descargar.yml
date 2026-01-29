@@ -1,8 +1,9 @@
-name: SEACE CSV ZIP -> BigQuery (staging mensual + UNION final, sin mezcla)
+name: SEACE -> BigQuery (STRING + staging mensual + UNION final + reporte filas)
 
 on:
   workflow_dispatch: {}
 
+# Evita ejecuciones simultáneas del mismo workflow (no mezcla)
 concurrency:
   group: seace-bq-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
@@ -15,22 +16,11 @@ jobs:
       PROJECT_ID: heroic-ruler-481618-e5
       FINAL_DS: github_actions
       STG_DS: github_actions_stg
+
+      # Puedes poner 2, 3, 10... Formato: YYYY-MM separados por coma
       MONTHS: "2026-01,2025-12,2025-11"
 
     steps:
-      # STEP 0: si esto no aparece, el workflow ni está siendo reconocido
-      - name: STEP 0 - Arranque y diagnóstico básico
-        shell: bash
-        run: |
-          set -euxo pipefail
-          echo "Workflow arrancó."
-          echo "Runner:"
-          uname -a
-          echo "PWD:"
-          pwd
-          echo "Repo files:"
-          ls -lah
-
       - name: Checkout (chék-aut)
         uses: actions/checkout@v4
 
@@ -44,37 +34,48 @@ jobs:
         with:
           project_id: ${{ env.PROJECT_ID }}
 
-      - name: Limpieza local inicial (tmp/ data/)
+      # 1) Limpieza local (primero)
+      - name: Limpieza local inicial
         shell: bash
         run: |
           set -euxo pipefail
-          mkdir -p tmp/zips tmp/unzipped data
-          rm -rf tmp/zips/* tmp/unzipped/* data/* || true
+          mkdir -p tmp/zips tmp/unzipped data reports
+          rm -rf tmp/zips/* tmp/unzipped/* data/* reports/* || true
 
-      - name: Preparar datasets y limpiar tablas BigQuery (solo inicio)
+      # 2) Limpieza BigQuery (primero, antes de subir)
+      - name: Limpiar tablas en BigQuery (FINAL y STG) antes de cargar
         shell: bash
         run: |
           set -euxo pipefail
+
+          # Crear datasets si no existen (no se borran datasets)
           bq --project_id="$PROJECT_ID" mk --dataset "$PROJECT_ID:$FINAL_DS" || true
           bq --project_id="$PROJECT_ID" mk --dataset "$PROJECT_ID:$STG_DS"   || true
 
+          echo "== Borrando tablas en FINAL: $FINAL_DS =="
           FINAL_TABLES=$(bq --project_id="$PROJECT_ID" ls --format=csv --max_results=100000 "$PROJECT_ID:$FINAL_DS" \
             | tail -n +2 | cut -d, -f1 || true)
           if [ -n "${FINAL_TABLES}" ]; then
             while IFS= read -r t; do
               bq --project_id="$PROJECT_ID" rm -f -t "$PROJECT_ID:$FINAL_DS.$t" || true
             done <<< "${FINAL_TABLES}"
+          else
+            echo "FINAL vacío."
           fi
 
+          echo "== Borrando tablas en STG: $STG_DS =="
           STG_TABLES=$(bq --project_id="$PROJECT_ID" ls --format=csv --max_results=100000 "$PROJECT_ID:$STG_DS" \
             | tail -n +2 | cut -d, -f1 || true)
           if [ -n "${STG_TABLES}" ]; then
             while IFS= read -r t; do
               bq --project_id="$PROJECT_ID" rm -f -t "$PROJECT_ID:$STG_DS.$t" || true
             done <<< "${STG_TABLES}"
+          else
+            echo "STG vacío."
           fi
 
-      - name: Descargar ZIPs SEACE (retries + verificación)
+      # 3) Descargar ZIPs (termina totalmente antes de procesar)
+      - name: Descargar ZIPs SEACE
         shell: bash
         run: |
           set -euxo pipefail
@@ -93,20 +94,24 @@ jobs:
             URL="https://contratacionesabiertas.oece.gob.pe/api/v1/file/seace_v3/csv/${YEAR}/${MONTH}"
             ZIP="tmp/zips/seace_${YEAR}_${MONTH}.zip"
 
+            echo "Descargando $ym -> $ZIP"
             curl -L -f -sS --retry 6 --retry-all-errors --retry-delay 2 "$URL" -o "$ZIP"
             test -s "$ZIP"
           done
 
+          echo "ZIPs descargados:"
           ls -lah tmp/zips
           COUNT=$(ls -1 tmp/zips/*.zip 2>/dev/null | wc -l)
+          echo "ZIP count: $COUNT"
           test "$COUNT" -gt 0
 
-      - name: Cargar staging por mes + crear tablas finales (UNION en BigQuery)
+      # 4) Proceso completo en 1 solo Python: staging -> conteos -> final -> conteos -> reporte
+      - name: STAGING (STRING) + FINAL (UNION) + conteo filas + reporte
         shell: bash
         run: |
           set -euxo pipefail
           python - <<'PY'
-          import os, re, glob, shutil, subprocess, sys
+          import os, re, glob, shutil, subprocess, sys, json
           from collections import defaultdict
 
           PROJECT_ID = os.environ["PROJECT_ID"]
@@ -116,139 +121,227 @@ jobs:
           ZIPS_DIR  = "tmp/zips"
           UNZIP_DIR = "tmp/unzipped"
           DATA_DIR  = "data"
-
+          REPORT_DIR = "reports"
           os.makedirs(UNZIP_DIR, exist_ok=True)
           os.makedirs(DATA_DIR, exist_ok=True)
+          os.makedirs(REPORT_DIR, exist_ok=True)
 
           def sh(cmd):
               r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
               print(r.stdout)
               return r.returncode, r.stdout
 
+          def safe_table_name(name_no_ext: str) -> str:
+              t = re.sub(r"[^A-Za-z0-9_]", "_", name_no_ext)
+              t = re.sub(r"_+", "_", t).strip("_")
+              if not t:
+                  t = "tabla"
+              if t[0].isdigit():
+                  t = "t_" + t
+              return t
+
           def normalize_headers_line(header: str):
               cols = header.rstrip("\n\r").split(",")
-              fixed, seen = [], {}
+              fixed = []
+              seen = {}
               for c in cols:
                   c = c.strip()
                   c = c.replace("/", "_").replace(" ", "_").replace("-", "_")
                   c = re.sub(r"[^A-Za-z0-9_]", "_", c)
                   c = re.sub(r"_+", "_", c).strip("_")
-                  if not c: c = "col"
-                  if c[0].isdigit(): c = "c_" + c
+                  if not c:
+                      c = "col"
+                  if c[0].isdigit():
+                      c = "c_" + c
+
                   base = c
                   k = seen.get(base, 0)
-                  if k > 0: c = f"{base}_{k}"
+                  if k > 0:
+                      c = f"{base}_{k}"
                   seen[base] = k + 1
                   fixed.append(c)
-              return ",".join(fixed) + "\n"
+              return fixed
 
-          def safe_table_name(name_no_ext: str) -> str:
-              t = re.sub(r"[^A-Za-z0-9_]", "_", name_no_ext)
-              t = re.sub(r"_+", "_", t).strip("_")
-              if not t: t = "tabla"
-              if t[0].isdigit(): t = "t_" + t
-              return t
+          def bq_count_rows(dataset: str, table: str) -> int:
+              sql = f"SELECT COUNT(1) AS rows FROM `{PROJECT_ID}.{dataset}.{table}`"
+              rc, out = sh(["bq", f"--project_id={PROJECT_ID}", "query", "--nouse_legacy_sql", "--format=csv", sql])
+              if rc != 0:
+                  return -1
+              lines = [x.strip() for x in out.splitlines() if x.strip()]
+              # formato esperado:
+              # rows
+              # 123
+              if len(lines) >= 2 and lines[0].lower() == "rows":
+                  try:
+                      return int(lines[1])
+                  except:
+                      return -1
+              return -1
+
+          def bq_common_columns(dataset: str, tables: list[str]) -> list[str]:
+              # Intersección de columnas en INFORMATION_SCHEMA (para no fallar si varían)
+              table_names_sql = ", ".join([f"'{t}'" for t in tables])
+              sql = f"""
+              SELECT column_name
+              FROM `{PROJECT_ID}.{dataset}.INFORMATION_SCHEMA.COLUMNS`
+              WHERE table_name IN ({table_names_sql})
+              GROUP BY column_name
+              HAVING COUNT(DISTINCT table_name) = {len(tables)}
+              ORDER BY column_name
+              """
+              rc, out = sh(["bq", f"--project_id={PROJECT_ID}", "query", "--nouse_legacy_sql", "--format=csv", sql])
+              if rc != 0:
+                  return []
+              rows = [r.strip() for r in out.splitlines() if r.strip()]
+              # column_name
+              # col1
+              # col2
+              if len(rows) >= 2 and rows[0] == "column_name":
+                  return rows[1:]
+              return []
 
           zip_files = sorted(glob.glob(os.path.join(ZIPS_DIR, "seace_????_??.zip")))
           if not zip_files:
               print("[ERROR] No hay ZIPs en tmp/zips.")
               sys.exit(1)
 
+          # Reportes cacheados
+          staging_report = []  # dicts
+          final_report   = []  # dicts
+
+          # logical -> [stg_table_name]
           stg_tables_by_logical = defaultdict(list)
+
+          print("\n==============================")
+          print("FASE 1: CARGA STAGING (TODO STRING) + CONTEO FILAS")
+          print("==============================")
 
           for zip_path in zip_files:
               m = re.search(r"seace_(\d{4})_(\d{2})\.zip$", os.path.basename(zip_path))
               if not m:
                   print(f"[WARN] ZIP con nombre raro, se ignora: {zip_path}")
                   continue
+
               year, month = m.group(1), m.group(2)
               ym = f"{year}-{month}"
 
+              # Limpieza local entre meses (no mezcla de archivos)
               shutil.rmtree(UNZIP_DIR, ignore_errors=True)
               shutil.rmtree(DATA_DIR, ignore_errors=True)
               os.makedirs(UNZIP_DIR, exist_ok=True)
               os.makedirs(DATA_DIR, exist_ok=True)
 
+              print(f"\n--- Mes {ym}: unzip ---")
               rc, _ = sh(["unzip", "-o", zip_path, "-d", UNZIP_DIR])
-              if rc != 0: sys.exit(rc)
+              if rc != 0:
+                  sys.exit(rc)
 
-              csv_paths = sorted(glob.glob(os.path.join(UNZIP_DIR, "**", "*.csv"), recursive=True))
+              csv_paths = sorted(glob.glob(os.path.join(UNZIP_DIR, "*.csv")))
               if not csv_paths:
-                  print(f"[WARN] No hay CSVs en {ym}")
+                  print(f"[WARN] No hay CSVs en {ym}. Se salta.")
                   continue
 
               for src in csv_paths:
                   base = os.path.basename(src)
                   logical = safe_table_name(os.path.splitext(base)[0])
+
                   stg_table = f"{logical}__{year}_{month}"
                   stg_full  = f"{STG_DS}.{stg_table}"
-                  out_clean = os.path.join(DATA_DIR, f"{stg_table}.csv")
 
+                  out_csv = os.path.join(DATA_DIR, f"{stg_table}.csv")
+                  schema_path = os.path.join(DATA_DIR, f"{stg_table}_schema.json")
+
+                  # Leer archivo, quitar NUL, normalizar HEADER, escribir CSV limpio
                   with open(src, "rb") as f:
                       b = f.read().replace(b"\x00", b"")
-                  lines = b.decode("utf-8", errors="replace").splitlines(True)
-                  if not lines: continue
+                  text = b.decode("utf-8", errors="replace").splitlines(True)
+                  if not text:
+                      continue
 
-                  norm_header = normalize_headers_line(lines[0]).strip()
-                  new_lines = [f"anio_mes,{norm_header}\n"]
-                  for line in lines[1:]:
-                      if line.strip() == "": continue
-                      new_lines.append(f"{ym}," + line)
+                  cols = normalize_headers_line(text[0])
+                  text[0] = ",".join(cols) + "\n"
 
-                  with open(out_clean, "w", encoding="utf-8", newline="") as g:
-                      g.writelines(new_lines)
+                  with open(out_csv, "w", encoding="utf-8", newline="") as g:
+                      g.writelines(text)
 
+                  schema = [{"name": c, "type": "STRING", "mode": "NULLABLE"} for c in cols]
+                  with open(schema_path, "w", encoding="utf-8") as s:
+                      json.dump(schema, s)
+
+                  # Cargar staging SIN autodetect (todo STRING)
                   cmd = [
                       "bq", f"--project_id={PROJECT_ID}", "load",
                       "--source_format=CSV",
-                      "--autodetect",
                       "--skip_leading_rows=1",
                       "--allow_quoted_newlines",
                       "--allow_jagged_rows",
                       "--max_bad_records=5000",
                       "--replace",
+                      f"--schema={schema_path}",
                       stg_full,
-                      out_clean
+                      out_csv
                   ]
+
+                  print(f"STG load: {ym} | {base} -> {PROJECT_ID}:{stg_full}")
                   rc, _ = sh(cmd)
                   if rc != 0:
-                      print(f"[ERROR] staging load falló: {src} -> {stg_full}")
+                      print(f"[ERROR] Falló staging load: {src} -> {stg_full}")
                       sys.exit(rc)
+
+                  # Conteo filas staging
+                  rows = bq_count_rows(STG_DS, stg_table)
+                  staging_report.append({
+                      "fase": "staging",
+                      "anio_mes": ym,
+                      "archivo": base,
+                      "logical": logical,
+                      "tabla_bq": f"{STG_DS}.{stg_table}",
+                      "filas": rows
+                  })
 
                   stg_tables_by_logical[logical].append(stg_table)
 
           if not stg_tables_by_logical:
-              print("[ERROR] No se cargó nada a staging.")
+              print("[ERROR] No se cargó ninguna tabla staging. Nada que consolidar.")
               sys.exit(1)
+
+          total_stg_tables = sum(len(v) for v in stg_tables_by_logical.values())
+
+          print("\n==============================")
+          print("FASE 2: CREAR TABLAS FINALES (UNION ALL EN BIGQUERY) + CONTEO FILAS")
+          print("==============================")
 
           for logical, stg_list in stg_tables_by_logical.items():
               stg_list = [t for t in stg_list if t]
-              if not stg_list: continue
+              if not stg_list:
+                  continue
 
-              table_names_sql = ", ".join([f"'{t}'" for t in stg_list])
-              q_cols = f"""
-              SELECT column_name
-              FROM `{PROJECT_ID}.{STG_DS}.INFORMATION_SCHEMA.COLUMNS`
-              WHERE table_name IN ({table_names_sql})
-                AND column_name != 'anio_mes'
-              GROUP BY column_name
-              HAVING COUNT(DISTINCT table_name) = {len(stg_list)}
-              ORDER BY column_name
-              """
+              print(f"\n--- FINAL: {FINAL_DS}.{logical} (meses={len(stg_list)}) ---")
 
-              rc, out = sh(["bq", f"--project_id={PROJECT_ID}", "query", "--nouse_legacy_sql", "--format=csv", q_cols])
-              if rc != 0:
-                  print(f"[ERROR] info_schema falló para {logical}")
-                  sys.exit(rc)
+              common_cols = bq_common_columns(STG_DS, stg_list)
+              # No dependemos de anio_mes en staging. Se agrega literal.
+              # Y todo se castea a STRING para mantener texto plano.
 
-              rows = [r.strip() for r in out.splitlines() if r.strip()]
-              common_cols = rows[1:] if len(rows) >= 2 else []
+              union_parts = []
+              for t in stg_list:
+                  mm = re.search(r"__(\d{4})_(\d{2})$", t)
+                  if not mm:
+                      continue
+                  ym = f"{mm.group(1)}-{mm.group(2)}"
 
-              select_exprs = ["anio_mes"] + [f"CAST({c} AS STRING) AS {c}" for c in common_cols]
-              union_parts = [
-                  "SELECT " + ", ".join(select_exprs) + f" FROM `{PROJECT_ID}.{STG_DS}.{t}`"
-                  for t in stg_list
-              ]
+                  exprs = [f"'{ym}' AS anio_mes"]
+                  for c in common_cols:
+                      if c == "anio_mes":
+                          continue
+                      exprs.append(f"CAST({c} AS STRING) AS {c}")
+
+                  union_parts.append(
+                      "SELECT " + ", ".join(exprs) + f" FROM `{PROJECT_ID}.{STG_DS}.{t}`"
+                  )
+
+              if not union_parts:
+                  print(f"[ERROR] No hay UNION parts para {logical}")
+                  sys.exit(1)
 
               final_sql = f"""
               CREATE OR REPLACE TABLE `{PROJECT_ID}.{FINAL_DS}.{logical}` AS
@@ -260,5 +353,49 @@ jobs:
                   print(f"[ERROR] crear final falló para {logical}")
                   sys.exit(rc)
 
-          print("OK")
+              final_rows = bq_count_rows(FINAL_DS, logical)
+              final_report.append({
+                  "fase": "final",
+                  "logical": logical,
+                  "tabla_bq": f"{FINAL_DS}.{logical}",
+                  "filas": final_rows,
+                  "staging_tables_usadas": len(stg_list),
+                  "columnas_comunes": len([c for c in common_cols if c != "anio_mes"])
+              })
+
+          total_final_tables = len(final_report)
+
+          # Guardar reportes cacheados
+          with open(os.path.join(REPORT_DIR, "staging_report.json"), "w", encoding="utf-8") as f:
+              json.dump(staging_report, f, ensure_ascii=False, indent=2)
+          with open(os.path.join(REPORT_DIR, "final_report.json"), "w", encoding="utf-8") as f:
+              json.dump(final_report, f, ensure_ascii=False, indent=2)
+
+          # Imprimir resumen (lo que pediste: números y filas)
+          print("\n==============================")
+          print("RESUMEN CACHEADO DEL PROCESO")
+          print("==============================")
+          print(f"Tablas STAGING cargadas (total): {total_stg_tables}")
+          print(f"Tablas FINALES creadas (total): {total_final_tables}")
+
+          print("\n--- Filas por tabla en STAGING ---")
+          for r in staging_report:
+              print(f"{r['anio_mes']} | {r['tabla_bq']} | filas={r['filas']} | archivo={r['archivo']}")
+
+          print("\n--- Filas por tabla FINAL ---")
+          for r in final_report:
+              print(f"{r['tabla_bq']} | filas={r['filas']} | staging_usadas={r['staging_tables_usadas']} | cols_comunes={r['columnas_comunes']}")
+
+          print("\nOK: Proceso terminado. Reportes en reports/staging_report.json y reports/final_report.json")
           PY
+
+      # 5) Mostrar archivos de reporte (solo log)
+      - name: Ver reportes (cache)
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ls -lah reports
+          echo "---- staging_report.json (primeros 40) ----"
+          head -n 40 reports/staging_report.json || true
+          echo "---- final_report.json (primeros 40) ----"
+          head -n 40 reports/final_report.json || true
